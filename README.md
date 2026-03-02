@@ -264,6 +264,26 @@ The TUI scans both `exports/` and `examples/templates/` for available agents.
 
 See [environment-setup.md](docs/environment-setup.md) for complete setup instructions.
 
+## Frontend
+
+Hive includes a modern web interface built with React and TypeScript for agent management and monitoring.
+
+```bash
+# Launch the web interface (Recommended)
+hive serve
+
+# Or start the development server directly
+cd core/frontend
+npm install
+npm run dev
+```
+
+Features:
+- **Agent Management** - Browse, create, and configure agents
+- **Real-time Monitoring** - Live execution tracking and logs
+- **Interactive Chat** - Direct communication with running agents
+- **Graph Visualization** - Visual representation of agent workflows
+
 ## Documentation
 
 - **[Developer Guide](docs/developer-guide.md)** - Comprehensive guide for developers
