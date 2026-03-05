@@ -1,7 +1,5 @@
-"""Discord Bot API integration for Aden Hive."""
+"""Discord tool package for Aden Tools."""
 
-from .register import register_tools
+from .discord_tool import register_tools
 
-__all__ = [
-    "register_tools",
-]
+__all__ = ["register_tools"]

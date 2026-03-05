@@ -1,237 +1,44 @@
-# Discord Bot API Integration
+# Discord Tool
 
-Complete Discord Bot API integration for Aden Hive framework providing 4 MCP tools for Discord automation and communication.
+Send messages and interact with Discord servers via the Discord API.
 
-## Overview
+## Supported Actions
 
-The Discord tool enables AI agents to interact with Discord servers through bot functionality including:
-- Send messages to channels with rich embeds
-- Read message history and metadata
-- List and filter server channels
-- Add emoji reactions to messages
+- **discord_list_guilds** – List guilds (servers) the bot is a member of
+- **discord_list_channels** – List channels for a guild (optional `text_only` filter)
+- **discord_send_message** – Send a message to a channel (validates 2000-char limit)
+- **discord_get_messages** – Get recent messages from a channel
+
+## Limits & Validation
+
+- **Message length**: Max 2000 characters (validated before sending)
+- **Rate limits**: Automatically retries up to 2 times on 429 using Discord's `retry_after`; returns clear error when exhausted
+- **Channel filtering**: `discord_list_channels` defaults to text channels only; use `text_only=False` for all types
 
 ## Setup
 
-### 1. Create Discord Bot
+1. Create a Discord application at [Discord Developer Portal](https://discord.com/developers/applications).
 
-1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
-2. Create new application and bot
-3. Copy bot token
-4. Invite bot to your server with required permissions
+2. Create a bot:
+   - Go to **Bot** section
+   - Add a bot and copy the token
 
-### 2. Configure Credentials
+3. Invite the bot to your server:
+   - Go to **OAuth2** → **URL Generator**
+   - Scopes: `bot`
+   - Bot permissions: `Send Messages`, `Read Message History`, `View Channels`, `Read Messages/View Channels`
+   - Use the generated URL to invite the bot
 
-Set your Discord bot token:
+4. Set the environment variable:
+   ```bash
+   export DISCORD_BOT_TOKEN=your_bot_token_here
+   ```
 
-```bash
-export DISCORD_BOT_TOKEN="your_bot_token_here"
-```
+## Getting IDs
 
-### 3. Bot Permissions
+Enable **Developer Mode** in Discord (User Settings → Advanced → Developer Mode).
+Then right-click a server or channel to **Copy ID**.
 
-Required bot permissions:
-- `Send Messages` - Send messages to channels
-- `Read Message History` - Read channel message history  
-- `Add Reactions` - Add emoji reactions
-- `View Channels` - List and access channels
+## Use Case
 
-## Tools
-
-### discord_send_message
-
-Send messages to Discord channels with optional rich embeds.
-
-```python
-await discord_send_message(
-    channel_id="123456789",
-    content="Hello Discord!",
-    embed_title="Status Update",
-    embed_description="Agent task completed successfully",
-    embed_color=0x00FF00
-)
-```
-
-**Parameters:**
-- `channel_id` (str): Discord channel ID
-- `content` (str): Message text content
-- `embed_title` (str, optional): Embed title
-- `embed_description` (str, optional): Embed description
-- `embed_color` (int, optional): Embed color as integer
-
-**Returns:**
-```json
-{
-  "success": true,
-  "message_id": "987654321",
-  "channel_id": "123456789"
-}
-```
-
-### discord_read_messages
-
-Fetch recent messages from Discord channels with metadata.
-
-```python
-await discord_read_messages(
-    channel_id="123456789",
-    limit=20
-)
-```
-
-**Parameters:**
-- `channel_id` (str): Discord channel ID
-- `limit` (int): Number of messages to fetch (max 100)
-
-**Returns:**
-```json
-{
-  "success": true,
-  "messages": [
-    {
-      "id": "987654321",
-      "content": "Hello world!",
-      "author": "Username#1234",
-      "channel_id": "123456789",
-      "timestamp": "2024-01-01T12:00:00",
-      "reactions": ["👍", "❤️"]
-    }
-  ],
-  "count": 1,
-  "channel_id": "123456789"
-}
-```
-
-### discord_list_channels
-
-List accessible channels in Discord servers with filtering.
-
-```python
-await discord_list_channels(
-    guild_id="123456789",
-    channel_type="text"
-)
-```
-
-**Parameters:**
-- `guild_id` (str, optional): Filter by specific server
-- `channel_type` (str, optional): Filter by channel type (text, voice, category)
-
-**Returns:**
-```json
-{
-  "success": true,
-  "channels": [
-    {
-      "id": "123456789",
-      "name": "general",
-      "type": "text",
-      "guild_id": "987654321"
-    }
-  ],
-  "count": 1,
-  "guild_id": "987654321"
-}
-```
-
-### discord_add_reaction
-
-Add emoji reactions to Discord messages.
-
-```python
-await discord_add_reaction(
-    channel_id="123456789",
-    message_id="987654321",
-    emoji="👍"
-)
-```
-
-**Parameters:**
-- `channel_id` (str): Discord channel ID
-- `message_id` (str): Discord message ID
-- `emoji` (str): Unicode emoji or custom emoji name
-
-**Returns:**
-```json
-{
-  "success": true,
-  "channel_id": "123456789",
-  "message_id": "987654321",
-  "emoji": "👍"
-}
-```
-
-## Error Handling
-
-All tools return structured error responses:
-
-```json
-{
-  "success": false,
-  "error": "Channel 123456789 not found"
-}
-```
-
-Common errors:
-- Invalid channel/message IDs
-- Missing bot permissions
-- Network connectivity issues
-- Invalid bot token
-
-## Rate Limiting
-
-Discord API rate limiting is handled automatically by discord.py library:
-- Message sending: ~5 requests/5 seconds per channel
-- Message reading: ~50 requests/second
-- Reactions: ~1 request/0.25 seconds per channel
-
-## Usage Examples
-
-### Customer Support Bot
-
-```python
-# Monitor support channel and respond
-messages = await discord_read_messages("support-channel-id", 10)
-for msg in messages["messages"]:
-    if "help" in msg["content"].lower():
-        await discord_send_message(
-            msg["channel_id"],
-            f"Hi {msg['author']}, I'll help you with that!",
-            embed_title="Support Request Received",
-            embed_color=0x0099FF
-        )
-        await discord_add_reaction(msg["channel_id"], msg["id"], "✅")
-```
-
-### Status Updates
-
-```python
-# Send deployment status to team channel
-await discord_send_message(
-    "team-channel-id",
-    "Deployment completed successfully!",
-    embed_title="🚀 Production Deploy",
-    embed_description="Version 2.1.0 is now live",
-    embed_color=0x00FF00
-)
-```
-
-### Channel Management
-
-```python
-# List all text channels in server
-channels = await discord_list_channels("server-id", "text")
-for channel in channels["channels"]:
-    print(f"Channel: #{channel['name']} (ID: {channel['id']})")
-```
-
-## Dependencies
-
-- `discord.py>=2.4.0` - Discord API client library
-- `aiohttp>=3.9.0` - Async HTTP client (discord.py dependency)
-
-## Health Check
-
-The credential spec includes health check endpoint:
-- **URL**: `https://discord.com/api/v10/users/@me`
-- **Method**: GET with bot token authentication
-- **Purpose**: Validate bot token and API connectivity
+Example: "When a production incident is resolved, post a short summary to our #incidents Discord channel."

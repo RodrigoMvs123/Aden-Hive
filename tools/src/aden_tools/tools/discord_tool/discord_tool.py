@@ -1,318 +1,290 @@
-"""Discord Bot API integration tools for Aden Hive."""
+"""
+Discord Tool - Send messages and interact with Discord servers via Discord API.
 
-import logging
+Supports:
+- Bot tokens (DISCORD_BOT_TOKEN)
+
+API Reference: https://discord.com/developers/docs
+"""
+
+from __future__ import annotations
+
 import os
-from typing import Any
+import time
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from fastmcp import FastMCP
-from pydantic import BaseModel, Field
 
-logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from aden_tools.credentials import CredentialStoreAdapter
 
-
-class DiscordMessage(BaseModel):
-    """Discord message model."""
-    id: str
-    content: str
-    author: str
-    channel_id: str
-    timestamp: str
-    reactions: list[str] = Field(default_factory=list)
-
-
-class DiscordChannel(BaseModel):
-    """Discord channel model."""
-    id: str
-    name: str
-    type: str
-    guild_id: str | None = None
+DISCORD_API_BASE = "https://discord.com/api/v10"
+MAX_MESSAGE_LENGTH = 2000  # Discord API limit
+# Channel types: 0 = GUILD_TEXT, 5 = GUILD_ANNOUNCEMENT (both support messages)
+TEXT_CHANNEL_TYPES = (0, 5)
+MAX_RETRIES = 2  # 3 total attempts on 429
+MAX_RETRY_WAIT = 60  # cap wait at 60s
 
 
 class _DiscordClient:
-    """Internal Discord client wrapper."""
+    """Internal client wrapping Discord API calls."""
 
     def __init__(self, bot_token: str):
-        self.bot_token = bot_token
-        self.base_url = "https://discord.com/api/v10"
+        self._token = bot_token
 
     @property
-    def _headers(self) -> dict:
+    def _headers(self) -> dict[str, str]:
         return {
-            "Authorization": f"Bot {self.bot_token}",
+            "Authorization": f"Bot {self._token}",
             "Content-Type": "application/json",
         }
 
-    def send_message(
-        self, channel_id: str, content: str, embed: dict | None = None
+    def _request_with_retry(
+        self,
+        method: str,
+        url: str,
+        **kwargs: Any,
     ) -> dict[str, Any]:
-        """Send message to Discord channel."""
-        payload: dict[str, Any] = {"content": content}
-        if embed:
-            payload["embeds"] = [embed]
+        """Make HTTP request with retry on 429 rate limit."""
+        request_kwargs = {"headers": self._headers, "timeout": 30.0, **kwargs}
+        for attempt in range(MAX_RETRIES + 1):
+            response = httpx.request(method, url, **request_kwargs)
+            if response.status_code == 429 and attempt < MAX_RETRIES:
+                try:
+                    data = response.json()
+                    wait = min(float(data.get("retry_after", 1)), MAX_RETRY_WAIT)
+                except Exception:
+                    wait = min(2**attempt, MAX_RETRY_WAIT)
+                time.sleep(wait)
+                continue
+            return self._handle_response(response)
+        return self._handle_response(response)
 
-        response = httpx.post(
-            f"{self.base_url}/channels/{channel_id}/messages",
-            headers=self._headers,
-            json=payload,
-            timeout=30.0,
-        )
+    def _handle_response(self, response: httpx.Response) -> dict[str, Any]:
+        """Handle Discord API response format."""
+        if response.status_code == 204:
+            return {"success": True}
+
+        if response.status_code == 429:
+            try:
+                data = response.json()
+                retry_after = data.get("retry_after", 60)
+                message = data.get("message", "Rate limit exceeded")
+            except Exception:
+                retry_after = 60
+                message = "Rate limit exceeded"
+            return {
+                "error": f"Discord rate limit exceeded. Retry after {retry_after}s",
+                "retry_after": retry_after,
+                "message": message,
+            }
 
         if response.status_code != 200:
-            return {"error": f"HTTP {response.status_code}: {response.text}"}
+            try:
+                data = response.json()
+                message = data.get("message", response.text)
+            except Exception:
+                message = response.text
+            return {"error": f"HTTP {response.status_code}: {message}"}
 
         return response.json()
 
-    def read_messages(self, channel_id: str, limit: int = 10) -> list[DiscordMessage]:
-        """Read messages from Discord channel."""
-        response = httpx.get(
-            f"{self.base_url}/channels/{channel_id}/messages",
-            headers=self._headers,
-            params={"limit": limit},
-            timeout=30.0,
+    def list_guilds(self) -> dict[str, Any]:
+        """List guilds (servers) the bot is a member of."""
+        return self._request_with_retry("GET", f"{DISCORD_API_BASE}/users/@me/guilds")
+
+    def list_channels(self, guild_id: str, text_only: bool = True) -> dict[str, Any]:
+        """List channels for a guild. Optionally filter to text channels only."""
+        result = self._request_with_retry("GET", f"{DISCORD_API_BASE}/guilds/{guild_id}/channels")
+        if isinstance(result, dict) and "error" in result:
+            return result
+        if text_only:
+            result = [c for c in result if c.get("type") in TEXT_CHANNEL_TYPES]
+        return result
+
+    def send_message(
+        self,
+        channel_id: str,
+        content: str,
+        *,
+        tts: bool = False,
+    ) -> dict[str, Any]:
+        """Send a message to a channel."""
+        body: dict[str, Any] = {"content": content, "tts": tts}
+        return self._request_with_retry(
+            "POST",
+            f"{DISCORD_API_BASE}/channels/{channel_id}/messages",
+            json=body,
         )
 
-        if response.status_code != 200:
-            raise ValueError(f"HTTP {response.status_code}: {response.text}")
-
-        messages = []
-        for msg in response.json():
-            reactions = [r["emoji"]["name"] for r in msg.get("reactions", [])]
-            messages.append(DiscordMessage(
-                id=msg["id"],
-                content=msg.get("content", ""),
-                author=msg["author"].get("username", "unknown"),
-                channel_id=msg["channel_id"],
-                timestamp=msg["timestamp"],
-                reactions=reactions
-            ))
-
-        return messages
-
-    def list_channels(self, guild_id: str) -> list[DiscordChannel]:
-        """List Discord channels in guild."""
-        response = httpx.get(
-            f"{self.base_url}/guilds/{guild_id}/channels",
-            headers=self._headers,
-            timeout=30.0,
+    def get_messages(
+        self,
+        channel_id: str,
+        limit: int = 50,
+        before: str | None = None,
+        after: str | None = None,
+    ) -> dict[str, Any]:
+        """Get recent messages from a channel."""
+        params: dict[str, Any] = {"limit": min(limit, 100)}
+        if before:
+            params["before"] = before
+        if after:
+            params["after"] = after
+        return self._request_with_retry(
+            "GET",
+            f"{DISCORD_API_BASE}/channels/{channel_id}/messages",
+            params=params,
         )
-
-        if response.status_code != 200:
-            raise ValueError(f"HTTP {response.status_code}: {response.text}")
-
-        channels = []
-        for ch in response.json():
-            channels.append(DiscordChannel(
-                id=ch["id"],
-                name=ch.get("name", "unknown"),
-                type=str(ch.get("type", 0)),
-                guild_id=guild_id
-            ))
-
-        return channels
-
-    def add_reaction(self, channel_id: str, message_id: str, emoji: str) -> bool:
-        """Add reaction to Discord message."""
-        import urllib.parse
-        emoji_encoded = urllib.parse.quote(emoji)
-
-        response = httpx.put(
-            f"{self.base_url}/channels/{channel_id}/messages/{message_id}/reactions/{emoji_encoded}/@me",
-            headers=self._headers,
-            timeout=30.0,
-        )
-
-        if response.status_code not in (204, 200):
-            raise ValueError(f"HTTP {response.status_code}: {response.text}")
-
-        return True
 
 
 def register_tools(
     mcp: FastMCP,
-    credentials: Any = None,
+    credentials: CredentialStoreAdapter | None = None,
 ) -> None:
-    """Register Discord tools with FastMCP server."""
+    """Register Discord tools with the MCP server."""
 
-    def _get_token() -> str | None:
-        """Get Discord bot token from credentials or environment."""
+    def _get_token(account: str = "") -> str | None:
+        """Get Discord bot token from credential manager or environment."""
         if credentials is not None:
+            if account:
+                return credentials.get_by_alias("discord", account)
             token = credentials.get("discord")
             if token is not None and not isinstance(token, str):
                 raise TypeError(
-                    f"Expected string from credentials.get('discord'), "
-                    f"got {type(token).__name__}"
+                    f"Expected string from credentials.get('discord'), got {type(token).__name__}"
                 )
             return token
         return os.getenv("DISCORD_BOT_TOKEN")
 
-    def _get_client() -> _DiscordClient | dict:
-        """Get Discord client or return error dict."""
-        token = _get_token()
+    def _get_client(account: str = "") -> _DiscordClient | dict[str, str]:
+        """Get a Discord client, or return an error dict if no credentials."""
+        token = _get_token(account)
         if not token:
             return {
                 "error": "Discord credentials not configured",
                 "help": (
-                    "Set DISCORD_BOT_TOKEN environment variable or "
-                    "configure via credential store"
+                    "Set DISCORD_BOT_TOKEN environment variable or configure via credential store"
                 ),
             }
         return _DiscordClient(token)
 
     @mcp.tool()
+    def discord_list_guilds(account: str = "") -> dict:
+        """
+        List Discord guilds (servers) the bot is a member of.
+
+        Returns guild IDs and names. Use guild IDs with discord_list_channels.
+
+        Returns:
+            Dict with list of guilds or error
+        """
+        client = _get_client(account)
+        if isinstance(client, dict):
+            return client
+        try:
+            result = client.list_guilds()
+            if "error" in result:
+                return result
+            return {"guilds": result, "success": True}
+        except httpx.TimeoutException:
+            return {"error": "Request timed out"}
+        except httpx.RequestError as e:
+            return {"error": f"Network error: {e}"}
+
+    @mcp.tool()
+    def discord_list_channels(guild_id: str, text_only: bool = True, account: str = "") -> dict:
+        """
+        List channels for a Discord guild (server).
+
+        Args:
+            guild_id: Guild (server) ID. Enable Developer Mode in Discord and
+                       right-click the server to copy ID. Or use discord_list_guilds.
+            text_only: If True (default), return only text channels (type 0 and 5).
+                       Set False to include voice, category, and other channel types.
+
+        Returns:
+            Dict with list of channels or error
+        """
+        client = _get_client(account)
+        if isinstance(client, dict):
+            return client
+        try:
+            result = client.list_channels(guild_id, text_only=text_only)
+            if "error" in result:
+                return result
+            return {"channels": result, "success": True}
+        except httpx.TimeoutException:
+            return {"error": "Request timed out"}
+        except httpx.RequestError as e:
+            return {"error": f"Network error: {e}"}
+
+    @mcp.tool()
     def discord_send_message(
         channel_id: str,
         content: str,
-        embed_title: str | None = None,
-        embed_description: str | None = None,
-        embed_color: int | None = None
+        tts: bool = False,
+        account: str = "",
     ) -> dict:
         """
         Send a message to a Discord channel.
 
         Args:
-            channel_id: Discord channel ID
-            content: Message content
-            embed_title: Optional embed title
-            embed_description: Optional embed description
-            embed_color: Optional embed color (integer)
+            channel_id: Channel ID (right-click channel > Copy ID in Dev Mode)
+            content: Message text (max 2000 characters)
+            tts: Whether to use text-to-speech
 
         Returns:
-            Dict with message_id and success status
+            Dict with message details or error
         """
-        client = _get_client()
+        if len(content) > MAX_MESSAGE_LENGTH:
+            return {
+                "error": f"Message exceeds {MAX_MESSAGE_LENGTH} character limit",
+                "max_length": MAX_MESSAGE_LENGTH,
+                "provided": len(content),
+            }
+        client = _get_client(account)
         if isinstance(client, dict):
             return client
-
         try:
-            embed = None
-            if embed_title or embed_description:
-                embed = {}
-                if embed_title:
-                    embed["title"] = embed_title
-                if embed_description:
-                    embed["description"] = embed_description
-                if embed_color:
-                    embed["color"] = embed_color
-
-            result = client.send_message(channel_id, content, embed)
-
+            result = client.send_message(channel_id, content, tts=tts)
             if "error" in result:
                 return result
-
-            return {
-                "success": True,
-                "message_id": result.get("id"),
-                "channel_id": channel_id
-            }
-
-        except Exception as e:
-            logger.error(f"Failed to send Discord message: {e}")
-            return {"success": False, "error": str(e)}
+            return {"success": True, "message": result}
+        except httpx.TimeoutException:
+            return {"error": "Request timed out"}
+        except httpx.RequestError as e:
+            return {"error": f"Network error: {e}"}
 
     @mcp.tool()
-    def discord_read_messages(
+    def discord_get_messages(
         channel_id: str,
-        limit: int = 10
+        limit: int = 50,
+        before: str | None = None,
+        after: str | None = None,
+        account: str = "",
     ) -> dict:
         """
-        Read recent messages from a Discord channel.
+        Get recent messages from a Discord channel.
 
         Args:
-            channel_id: Discord channel ID
-            limit: Number of messages to retrieve (max 100)
+            channel_id: Channel ID
+            limit: Max messages to return (1-100, default 50)
+            before: Message ID to get messages before (for pagination)
+            after: Message ID to get messages after (for pagination)
 
         Returns:
-            Dict with messages list and metadata
+            Dict with list of messages or error
         """
-        client = _get_client()
+        client = _get_client(account)
         if isinstance(client, dict):
             return client
-
         try:
-            if limit > 100:
-                limit = 100
-
-            messages = client.read_messages(channel_id, limit)
-
-            return {
-                "success": True,
-                "messages": [msg.model_dump() for msg in messages],
-                "count": len(messages),
-                "channel_id": channel_id
-            }
-
-        except Exception as e:
-            logger.error(f"Failed to read Discord messages: {e}")
-            return {"success": False, "error": str(e)}
-
-    @mcp.tool()
-    def discord_list_channels(
-        guild_id: str,
-        channel_type: str | None = None
-    ) -> dict:
-        """
-        List Discord channels in a guild.
-
-        Args:
-            guild_id: Discord guild (server) ID
-            channel_type: Optional channel type filter
-
-        Returns:
-            Dict with channels list and metadata
-        """
-        client = _get_client()
-        if isinstance(client, dict):
-            return client
-
-        try:
-            channels = client.list_channels(guild_id)
-
-            if channel_type:
-                channels = [ch for ch in channels if ch.type == channel_type]
-
-            return {
-                "success": True,
-                "channels": [ch.model_dump() for ch in channels],
-                "count": len(channels),
-                "guild_id": guild_id
-            }
-
-        except Exception as e:
-            logger.error(f"Failed to list Discord channels: {e}")
-            return {"success": False, "error": str(e)}
-
-    @mcp.tool()
-    def discord_add_reaction(
-        channel_id: str,
-        message_id: str,
-        emoji: str
-    ) -> dict:
-        """
-        Add a reaction to a Discord message.
-
-        Args:
-            channel_id: Discord channel ID
-            message_id: Discord message ID
-            emoji: Emoji to add (Unicode or custom emoji name)
-
-        Returns:
-            Dict with success status
-        """
-        client = _get_client()
-        if isinstance(client, dict):
-            return client
-
-        try:
-            success = client.add_reaction(channel_id, message_id, emoji)
-
-            return {
-                "success": success,
-                "channel_id": channel_id,
-                "message_id": message_id,
-                "emoji": emoji
-            }
-
-        except Exception as e:
-            logger.error(f"Failed to add Discord reaction: {e}")
-            return {"success": False, "error": str(e)}
+            result = client.get_messages(channel_id, limit=limit, before=before, after=after)
+            if "error" in result:
+                return result
+            return {"messages": result, "success": True}
+        except httpx.TimeoutException:
+            return {"error": "Request timed out"}
+        except httpx.RequestError as e:
+            return {"error": f"Network error: {e}"}

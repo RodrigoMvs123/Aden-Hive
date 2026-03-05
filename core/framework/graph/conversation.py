@@ -30,6 +30,8 @@ class Message:
     # Phase-aware compaction metadata (continuous mode)
     phase_id: str | None = None
     is_transition_marker: bool = False
+    # True when this message is real human input (from /chat), not a system prompt
+    is_client_input: bool = False
 
     def to_llm_dict(self) -> dict[str, Any]:
         """Convert to OpenAI-format message dict."""
@@ -67,6 +69,8 @@ class Message:
             d["phase_id"] = self.phase_id
         if self.is_transition_marker:
             d["is_transition_marker"] = self.is_transition_marker
+        if self.is_client_input:
+            d["is_client_input"] = self.is_client_input
         return d
 
     @classmethod
@@ -81,6 +85,7 @@ class Message:
             is_error=data.get("is_error", False),
             phase_id=data.get("phase_id"),
             is_transition_marker=data.get("is_transition_marker", False),
+            is_client_input=data.get("is_client_input", False),
         )
 
 
@@ -212,21 +217,11 @@ class NodeConversation:
         Layer 3 (focus) while preserving the conversation history.
         """
         self._system_prompt = new_prompt
+        self._meta_persisted = False  # re-persist with new prompt
 
     def set_current_phase(self, phase_id: str) -> None:
         """Set the current phase ID. Subsequent messages will be stamped with it."""
         self._current_phase = phase_id
-
-    async def switch_store(self, new_store: ConversationStore) -> None:
-        """Switch to a new persistence store at a phase transition.
-
-        Subsequent messages are written to *new_store*.  Meta (system
-        prompt, config) is re-persisted on the next write so the new
-        store's ``meta.json`` reflects the updated prompt.
-        """
-        self._store = new_store
-        self._meta_persisted = False
-        await new_store.write_cursor({"next_seq": self._next_seq})
 
     @property
     def current_phase(self) -> str | None:
@@ -258,6 +253,7 @@ class NodeConversation:
         content: str,
         *,
         is_transition_marker: bool = False,
+        is_client_input: bool = False,
     ) -> Message:
         msg = Message(
             seq=self._next_seq,
@@ -265,6 +261,7 @@ class NodeConversation:
             content=content,
             phase_id=self._current_phase,
             is_transition_marker=is_transition_marker,
+            is_client_input=is_client_input,
         )
         self._messages.append(msg)
         self._next_seq += 1
@@ -512,22 +509,38 @@ class NodeConversation:
         self._last_api_input_tokens = None
         return count
 
-    async def compact(self, summary: str, keep_recent: int = 2) -> None:
+    async def compact(
+        self,
+        summary: str,
+        keep_recent: int = 2,
+        phase_graduated: bool = False,
+    ) -> None:
         """Replace old messages with a summary, optionally keeping recent ones.
 
         Args:
             summary: Caller-provided summary text.
             keep_recent: Number of recent messages to preserve (default 2).
                          Clamped to [0, len(messages) - 1].
+            phase_graduated: When True and messages have phase_id metadata,
+                split at phase boundaries instead of using keep_recent.
+                Keeps current + previous phase intact; compacts older phases.
         """
         if not self._messages:
             return
 
-        # Clamp: must discard at least 1 message
-        keep_recent = max(0, min(keep_recent, len(self._messages) - 1))
-
         total = len(self._messages)
-        split = total - keep_recent if keep_recent > 0 else total
+
+        # Phase-graduated: find the split point based on phase boundaries.
+        # Keeps current phase + previous phase intact, compacts older phases.
+        if phase_graduated and self._current_phase:
+            split = self._find_phase_graduated_split()
+        else:
+            split = None
+
+        if split is None:
+            # Fallback: use keep_recent (non-phase or single-phase conversation)
+            keep_recent = max(0, min(keep_recent, total - 1))
+            split = total - keep_recent if keep_recent > 0 else total
 
         # Advance split past orphaned tool results at the boundary.
         # Tool-role messages reference a tool_use from the preceding
@@ -535,6 +548,10 @@ class NodeConversation:
         # compacted (old) portion the tool_result becomes invalid.
         while split < total and self._messages[split].role == "tool":
             split += 1
+
+        # Nothing to compact
+        if split == 0:
+            return
 
         old_messages = list(self._messages[:split])
         recent_messages = list(self._messages[split:])
@@ -569,6 +586,33 @@ class NodeConversation:
 
         self._messages = [summary_msg] + recent_messages
         self._last_api_input_tokens = None  # reset; next LLM call will recalibrate
+
+    def _find_phase_graduated_split(self) -> int | None:
+        """Find split point that preserves current + previous phase.
+
+        Returns the index of the first message in the protected set,
+        or None if phase graduation doesn't apply (< 3 phases).
+        """
+        # Collect distinct phases in order of first appearance
+        phases_seen: list[str] = []
+        for msg in self._messages:
+            if msg.phase_id and msg.phase_id not in phases_seen:
+                phases_seen.append(msg.phase_id)
+
+        # Need at least 3 phases for graduation to be meaningful
+        # (current + previous are protected, older get compacted)
+        if len(phases_seen) < 3:
+            return None
+
+        # Protect: current phase + previous phase
+        protected_phases = {phases_seen[-1], phases_seen[-2]}
+
+        # Find split: first message belonging to a protected phase
+        for i, msg in enumerate(self._messages):
+            if msg.phase_id in protected_phases:
+                return i
+
+        return None
 
     async def clear(self) -> None:
         """Remove all messages, keep system prompt, preserve ``_next_seq``."""
@@ -635,8 +679,19 @@ class NodeConversation:
     # --- Restore -----------------------------------------------------------
 
     @classmethod
-    async def restore(cls, store: ConversationStore) -> NodeConversation | None:
+    async def restore(
+        cls,
+        store: ConversationStore,
+        phase_id: str | None = None,
+    ) -> NodeConversation | None:
         """Reconstruct a NodeConversation from a store.
+
+        Args:
+            store: The conversation store to read from.
+            phase_id: If set, only load parts matching this phase_id.
+                Used in isolated mode so a node only sees its own
+                messages in the shared flat store.  In continuous mode
+                pass ``None`` to load all parts.
 
         Returns ``None`` if the store contains no metadata (i.e. the
         conversation was never persisted).
@@ -655,6 +710,8 @@ class NodeConversation:
         conv._meta_persisted = True
 
         parts = await store.read_parts()
+        if phase_id:
+            parts = [p for p in parts if p.get("phase_id") == phase_id]
         conv._messages = [Message.from_storage_dict(p) for p in parts]
 
         cursor = await store.read_cursor()
