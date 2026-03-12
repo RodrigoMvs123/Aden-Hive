@@ -272,6 +272,10 @@ OPENROUTER_TOOL_COMPAT_CACHE_TTL_SECONDS = 3600
 # OpenRouter routing can change over time, so tool-compat caching must expire.
 OPENROUTER_TOOL_COMPAT_MODEL_CACHE: dict[str, float] = {}
 
+# Transient stream errors (network blips, timeouts) use a separate cap
+# from rate-limit retries — 3 retries is sufficient for connection failures.
+STREAM_TRANSIENT_MAX_RETRIES = 3
+
 # Directory for dumping failed requests
 FAILED_REQUESTS_DIR = Path.home() / ".hive" / "failed_requests"
 
@@ -2028,14 +2032,10 @@ class LiteLLMProvider(LLMProvider):
                 # tail_events before the error, the stream was successful —
                 # yield what we have instead of discarding it.
                 if (accumulated_text or tool_calls_acc) and tail_events:
-                    # LiteLLM may wrap the original ValidationError in an
-                    # APIError with a different message.  Check the full
-                    # exception chain (str(e) + str(__cause__)).
                     _err_chain = f"{e} {e.__cause__}" if e.__cause__ else str(e)
                     _is_finish_reason_err = (
                         "finish_reason" in _err_chain and "validation error" in _err_chain.lower()
                     ) or (
-                        # Fallback: the APIError wrapper message for chunk-building failures
                         "building chunks" in str(e).lower()
                         and (accumulated_text or tool_calls_acc)
                     )
@@ -2062,13 +2062,13 @@ class LiteLLMProvider(LLMProvider):
                     ):
                         yield event
                     return
-                if _is_stream_transient_error(e) and attempt < RATE_LIMIT_MAX_RETRIES:
+                if _is_stream_transient_error(e) and attempt < STREAM_TRANSIENT_MAX_RETRIES:
                     wait = _compute_retry_delay(attempt, exception=e)
                     logger.warning(
                         f"[stream-retry] {self.model} transient error "
                         f"({type(e).__name__}): {e!s}. "
                         f"Retrying in {wait:.1f}s "
-                        f"(attempt {attempt + 1}/{RATE_LIMIT_MAX_RETRIES})"
+                        f"(attempt {attempt + 1}/{STREAM_TRANSIENT_MAX_RETRIES})"
                     )
                     await asyncio.sleep(wait)
                     continue
