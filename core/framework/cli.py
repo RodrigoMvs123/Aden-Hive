@@ -89,6 +89,11 @@ def main():
 
     register_testing_commands(subparsers)
 
+    # Register ALP export command (export-alp)
+    from framework.alp.cli import register_alp_commands
+
+    register_alp_commands(subparsers)
+
     args = parser.parse_args()
 
     if hasattr(args, "func"):
