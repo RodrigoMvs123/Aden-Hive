@@ -60,6 +60,7 @@ export default function Home() {
   const [agents, setAgents] = useState<DiscoverEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [voiceError, setVoiceError] = useState<string | null>(null);
 
   // Fetch agents on mount so data is ready when user toggles
   useEffect(() => {
@@ -103,8 +104,10 @@ export default function Home() {
     }
   }, [navigate]);
 
-  const handleVoiceError = useCallback((error: string) => {
-    console.error("Voice input error:", error);
+  const handleVoiceError = useCallback((err: string) => {
+    setVoiceError(err);
+    // Auto-clear after 4 seconds
+    setTimeout(() => setVoiceError(null), 4000);
   }, []);
 
   const { isListening, isSupported, startListening, stopListening } = useVoiceInput({
@@ -186,6 +189,13 @@ export default function Home() {
               </div>
             </div>
           </form>
+
+          {/* Voice error message */}
+          {voiceError && (
+            <p className="text-xs text-destructive text-center -mt-4 mb-2 px-2">
+              {voiceError}
+            </p>
+          )}
 
           {/* Action buttons */}
           <div className="flex items-center justify-center gap-3 mb-6">

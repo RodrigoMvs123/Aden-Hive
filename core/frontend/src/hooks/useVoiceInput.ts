@@ -64,6 +64,15 @@ export function useVoiceInput({ onResult, onError, lang = "en-US" }: UseVoiceInp
   useEffect(() => { onResultRef.current = onResult; }, [onResult]);
   useEffect(() => { onErrorRef.current = onError; }, [onError]);
 
+  // Sync lang to the recognition instance whenever it changes.
+  // The instance is created once on mount; this keeps it up-to-date
+  // without tearing it down and recreating it.
+  useEffect(() => {
+    if (recognitionRef.current) {
+      recognitionRef.current.lang = lang;
+    }
+  }, [lang]);
+
   useEffect(() => {
     const SpeechRecognitionConstructor =
       window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -183,15 +192,17 @@ export function useVoiceInput({ onResult, onError, lang = "en-US" }: UseVoiceInp
     }
   }, [isSupported, isListening]);
 
+  // Use hasStartedRef (synchronous) instead of isListening (state, may be
+  // slightly stale between onresult calling stop() and React flushing onend).
   const stopListening = useCallback(() => {
-    if (recognitionRef.current && isListening) {
+    if (recognitionRef.current && hasStartedRef.current) {
       try {
         recognitionRef.current.stop();
       } catch {
         // ignore
       }
     }
-  }, [isListening]);
+  }, []);
 
   return { isListening, isSupported, startListening, stopListening, error };
 }
