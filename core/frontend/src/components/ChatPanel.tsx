@@ -802,6 +802,8 @@ export default function ChatPanel({
                 type="button"
                 onClick={isListening ? stopListening : startListening}
                 disabled={disabled}
+                aria-label={isListening ? "Stop voice input" : "Start voice input"}
+                aria-pressed={isListening}
                 className={`p-2 rounded-lg transition-all ${
                   isListening
                     ? "bg-primary text-primary-foreground animate-pulse"

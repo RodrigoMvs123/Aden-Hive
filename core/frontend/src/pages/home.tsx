@@ -93,13 +93,14 @@ export default function Home() {
     }
   };
 
-  // Voice input integration
-  const handleVoiceResult = (transcript: string) => {
+  // Voice input integration — only navigate on final transcript
+  const handleVoiceResult = (transcript: string, isFinal: boolean) => {
     setInputValue(transcript);
-    // Automatically submit after setting the value
-    setTimeout(() => {
-      navigate(`/workspace?agent=new-agent&prompt=${encodeURIComponent(transcript.trim())}`);
-    }, 100);
+    if (isFinal && transcript.trim()) {
+      setTimeout(() => {
+        navigate(`/workspace?agent=new-agent&prompt=${encodeURIComponent(transcript.trim())}`);
+      }, 100);
+    }
   };
 
   const { isListening, isSupported, startListening, stopListening } = useVoiceInput({
@@ -108,11 +109,6 @@ export default function Home() {
       console.error("Voice input error:", error);
     },
   });
-
-  // Debug: log when isListening changes
-  useEffect(() => {
-    console.log("Home page - isListening changed to:", isListening);
-  }, [isListening]);
 
   return (
     <div className="min-h-screen bg-background flex flex-col">
@@ -166,6 +162,8 @@ export default function Home() {
                   <button
                     type="button"
                     onClick={isListening ? stopListening : startListening}
+                    aria-label={isListening ? "Stop voice input" : "Start voice input"}
+                    aria-pressed={isListening}
                     className={`w-7 h-7 rounded-lg flex items-center justify-center transition-all ${
                       isListening
                         ? "bg-primary text-primary-foreground animate-pulse"
