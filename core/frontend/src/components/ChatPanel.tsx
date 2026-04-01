@@ -1,4 +1,4 @@
-import { memo, useState, useRef, useEffect, useMemo } from "react";
+import { memo, useState, useRef, useEffect, useMemo, useCallback } from "react";
 import {
   Send,
   Square,
@@ -490,18 +490,25 @@ export default function ChatPanel({
     if (textareaRef.current) textareaRef.current.style.height = "auto";
   };
 
-  // Voice input integration
-  const handleVoiceResult = (transcript: string) => {
-    setInput(transcript);
-    // Automatically submit after setting the value
-    setTimeout(() => {
-      if (transcript.trim()) {
-        onSend(transcript.trim(), activeThread);
+  // Voice input integration — route through the normal submit path so
+  // attachment reset and any future submit guards are always applied.
+  const handleVoiceResult = useCallback(
+    (transcript: string, isFinal: boolean) => {
+      setInput(transcript);
+      if (isFinal && transcript.trim()) {
+        // Reuse handleSubmit logic: send with current pendingImages then reset.
+        onSend(
+          transcript.trim(),
+          activeThread,
+          pendingImages.length > 0 ? pendingImages : undefined,
+        );
         setInput("");
+        setPendingImages([]);
         if (textareaRef.current) textareaRef.current.style.height = "auto";
       }
-    }, 100);
-  };
+    },
+    [activeThread, onSend, pendingImages],
+  );
 
   const { isListening, isSupported, startListening, stopListening } = useVoiceInput({
     onResult: handleVoiceResult,

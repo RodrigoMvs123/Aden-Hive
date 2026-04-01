@@ -18,9 +18,6 @@ out/
 tools/src/uv.lock
 
 
-# Meeting notes agent specific
-examples/templates/meeting_notes_agent/.env
-
 # User configuration (copied from .example)
 config.yaml
 docker-compose.override.yml
