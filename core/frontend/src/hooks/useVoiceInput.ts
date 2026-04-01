@@ -37,6 +37,7 @@ declare global {
 interface UseVoiceInputOptions {
   onResult: (transcript: string, isFinal: boolean) => void;
   onError?: (error: string) => void;
+  lang?: string;
 }
 
 interface UseVoiceInputReturn {
@@ -47,7 +48,7 @@ interface UseVoiceInputReturn {
   error: string | null;
 }
 
-export function useVoiceInput({ onResult, onError }: UseVoiceInputOptions): UseVoiceInputReturn {
+export function useVoiceInput({ onResult, onError, lang = "en-US" }: UseVoiceInputOptions): UseVoiceInputReturn {
   const [isListening, setIsListening] = useState(false);
   const [isSupported, setIsSupported] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -76,7 +77,7 @@ export function useVoiceInput({ onResult, onError }: UseVoiceInputOptions): UseV
         const recognition = recognitionRef.current;
         recognition.continuous = false;
         recognition.interimResults = true;
-        recognition.lang = "en-US";
+        recognition.lang = lang;
         recognition.maxAlternatives = 1;
 
         recognition.onresult = (event: SpeechRecognitionEvent) => {

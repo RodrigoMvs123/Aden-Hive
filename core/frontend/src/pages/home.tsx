@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { Crown, Mail, Briefcase, Shield, Search, Newspaper, ArrowRight, Hexagon, Send, Bot, Radar, Reply, DollarSign, MapPin, Calendar, UserPlus, Twitter, Mic } from "lucide-react";
 import TopBar from "@/components/TopBar";
@@ -94,20 +94,22 @@ export default function Home() {
   };
 
   // Voice input integration — only navigate on final transcript
-  const handleVoiceResult = (transcript: string, isFinal: boolean) => {
+  const handleVoiceResult = useCallback((transcript: string, isFinal: boolean) => {
     setInputValue(transcript);
     if (isFinal && transcript.trim()) {
       setTimeout(() => {
         navigate(`/workspace?agent=new-agent&prompt=${encodeURIComponent(transcript.trim())}`);
       }, 100);
     }
-  };
+  }, [navigate]);
+
+  const handleVoiceError = useCallback((error: string) => {
+    console.error("Voice input error:", error);
+  }, []);
 
   const { isListening, isSupported, startListening, stopListening } = useVoiceInput({
     onResult: handleVoiceResult,
-    onError: (error) => {
-      console.error("Voice input error:", error);
-    },
+    onError: handleVoiceError,
   });
 
   return (
