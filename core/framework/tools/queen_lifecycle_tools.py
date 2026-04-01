@@ -121,10 +121,8 @@ class QueenPhaseState:
     # Community skills catalog (XML) — appended after protocols
     skills_catalog_prompt: str = ""
 
-    # Persona and communication style (set once at session start by persona hook,
-    # persisted here so they survive dynamic prompt refreshes across iterations).
-    persona_prefix: str = ""  # e.g. "You are a CFO. I am a CFO with 20 years..."
-    style_directive: str = ""  # e.g. "## Communication Style: Peer\n\n..."
+    # Cached recall block — populated async by recall_selector after each turn.
+    _cached_recall_block: str = ""
 
     def get_current_tools(self) -> list:
         """Return tools for the current phase."""
@@ -147,15 +145,8 @@ class QueenPhaseState:
         else:
             base = self.prompt_building
 
-        from framework.agents.queen.queen_memory import format_for_injection
-
-        memory = format_for_injection()
-        parts = []
-        if self.persona_prefix:
-            parts.append(self.persona_prefix)
-        parts.append(base)
-        if self.style_directive:
-            parts.append(self.style_directive)
+        memory = self._cached_recall_block
+        parts = [base]
         if self.skills_catalog_prompt:
             parts.append(self.skills_catalog_prompt)
         if self.protocols_prompt:
