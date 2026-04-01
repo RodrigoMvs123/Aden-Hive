@@ -26,12 +26,15 @@ from framework.graph.checkpoint_config import CheckpointConfig
 from framework.graph.edge import GraphSpec
 from framework.graph.executor import ExecutionResult
 from framework.llm import LiteLLMProvider
+from framework.runner.mcp_registry import MCPRegistry
 from framework.runner.tool_registry import ToolRegistry
 from framework.runtime.agent_runtime import AgentRuntime, create_agent_runtime
 from framework.runtime.execution_stream import EntryPointSpec
 
 from .config import default_config
 from .nodes import build_tester_node
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from framework.runner import AgentRunner
@@ -579,6 +582,23 @@ class CredentialTesterAgent:
         mcp_config_path = Path(__file__).parent / "mcp_servers.json"
         if mcp_config_path.exists():
             self._tool_registry.load_mcp_config(mcp_config_path)
+
+        try:
+            agent_dir = Path(__file__).parent
+            registry = MCPRegistry()
+            registry.initialize()
+            if (agent_dir / "mcp_registry.json").is_file():
+                self._tool_registry.set_mcp_registry_agent_path(agent_dir)
+            registry_configs, selection_max_tools = registry.load_agent_selection(agent_dir)
+            if registry_configs:
+                self._tool_registry.load_registry_servers(
+                    registry_configs,
+                    preserve_existing_tools=True,
+                    log_collisions=True,
+                    max_tools=selection_max_tools,
+                )
+        except Exception:
+            logger.warning("MCP registry config failed to load", exc_info=True)
 
         extra_kwargs = getattr(self.config, "extra_kwargs", {}) or {}
         llm = LiteLLMProvider(

@@ -70,6 +70,7 @@ from .file_system_toolkits.list_dir import register_tools as register_list_dir
 from .file_system_toolkits.replace_file_content import (
     register_tools as register_replace_file_content,
 )
+from .freshdesk_tool import register_tools as register_freshdesk
 from .github_tool import register_tools as register_github
 from .gitlab_tool import register_tools as register_gitlab
 from .gmail_tool import register_tools as register_gmail
@@ -88,6 +89,7 @@ from .kafka_tool import register_tools as register_kafka
 from .langfuse_tool import register_tools as register_langfuse
 from .linear_tool import register_tools as register_linear
 from .lusha_tool import register_tools as register_lusha
+from .mattermost_tool import register_tools as register_mattermost
 from .microsoft_graph_tool import register_tools as register_microsoft_graph
 from .mongodb_tool import register_tools as register_mongodb
 from .n8n_tool import register_tools as register_n8n
@@ -266,6 +268,7 @@ def _register_unverified(
     register_langfuse(mcp, credentials=credentials)
     register_linear(mcp, credentials=credentials)
     register_lusha(mcp, credentials=credentials)
+    register_mattermost(mcp, credentials=credentials)
     register_microsoft_graph(mcp, credentials=credentials)
     register_mongodb(mcp, credentials=credentials)
     register_n8n(mcp, credentials=credentials)
@@ -295,6 +298,7 @@ def _register_unverified(
     register_zendesk(mcp, credentials=credentials)
     register_zoho_crm(mcp, credentials=credentials)
     register_zoom(mcp, credentials=credentials)
+    register_freshdesk(mcp, credentials=credentials)
 
 
 def register_all_tools(

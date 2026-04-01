@@ -13,6 +13,10 @@ out/
 .env
 .env.local
 .env.*.local
+.venv
+/venv
+tools/src/uv.lock
+
 
 # Meeting notes agent specific
 examples/templates/meeting_notes_agent/.env
@@ -71,8 +75,6 @@ temp/
 exports/*
 
 .claude/settings.local.json
-
-.venv
 
 docs/github-issues/*
 core/tests/*dumps/*
