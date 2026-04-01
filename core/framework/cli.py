@@ -94,6 +94,21 @@ def main():
 
     register_alp_commands(subparsers)
 
+    # Register skill commands (skill list, skill trust, ...)
+    from framework.skills.cli import register_skill_commands
+
+    register_skill_commands(subparsers)
+
+    # Register debugger commands (debugger)
+    from framework.debugger.cli import register_debugger_commands
+
+    register_debugger_commands(subparsers)
+
+    # Register MCP registry commands (mcp install, mcp add, ...)
+    from framework.runner.mcp_registry_cli import register_mcp_commands
+
+    register_mcp_commands(subparsers)
+
     args = parser.parse_args()
 
     if hasattr(args, "func"):
