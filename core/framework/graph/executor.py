@@ -1012,7 +1012,7 @@ class GraphExecutor:
                         accounts_prompt=self.accounts_prompt,
                         accounts_data=self.accounts_data,
                         tool_provider_map=self.tool_provider_map,
-                        identity_prompt="",
+                        identity_prompt=getattr(graph, "identity_prompt", "") or "",
                         narrative="",
                         execution_id=self._execution_id,
                         run_id=self._run_id,
@@ -1294,6 +1294,7 @@ class GraphExecutor:
             node_registry=dict(self.node_registry),
             node_spec_registry={node.id: node for node in graph.nodes},
             parallel_config=self._parallel_config,
+            enable_parallel_execution=self.enable_parallel_execution,
             is_continuous=is_continuous,
             accounts_prompt=self.accounts_prompt,
             accounts_data=self.accounts_data,
@@ -1408,6 +1409,10 @@ class GraphExecutor:
             self.logger.error(execution_error)
             return True
 
+        # Track fan-out branch workers for per-branch timeout enforcement
+        _fanout_branch_tasks: dict[str, asyncio.Task] = {}  # worker_id → timeout-wrapper task
+        branch_timeout = self._parallel_config.branch_timeout_seconds if self._parallel_config else 300.0
+
         def _route_activation(
             activation: Activation,
             workers_map: dict[str, WorkerAgent],
@@ -1440,7 +1445,19 @@ class GraphExecutor:
             if target_worker.check_readiness():
                 target_worker.activate(inherited_tags=activation.fan_out_tags)
                 if target_worker._task is not None:
-                    pending_tasks_map[activation.target_id] = target_worker._task
+                    # Fan-out branch: wrap with timeout
+                    is_fanout_branch = any(
+                        tag.via_branch == activation.target_id
+                        for tag in activation.fan_out_tags
+                    )
+                    if is_fanout_branch and branch_timeout > 0:
+                        timed_task = asyncio.ensure_future(
+                            asyncio.wait_for(target_worker._task, timeout=branch_timeout)
+                        )
+                        _fanout_branch_tasks[activation.target_id] = timed_task
+                        pending_tasks_map[activation.target_id] = timed_task
+                    else:
+                        pending_tasks_map[activation.target_id] = target_worker._task
 
         # Subscribe to worker events
         sub_completed = None
@@ -1617,6 +1634,17 @@ class GraphExecutor:
                         except Exception as exc:
                             task_error = exc
 
+                        # Check for fan-out branch timeout
+                        if isinstance(task_error, asyncio.TimeoutError) and wid in _fanout_branch_tasks:
+                            error = f"Branch failed (timed out after {branch_timeout}s)"
+                            failed_workers[wid] = error
+                            worker.lifecycle = WorkerLifecycle.FAILED
+                            self.logger.warning(f"  ⏱ Branch {wid}: {error}")
+                            if wid in terminal_worker_ids:
+                                completed_terminals.add(wid)
+                            _fanout_branch_tasks.pop(wid, None)
+                            continue
+
                         if worker.lifecycle == WorkerLifecycle.COMPLETED and task_error is None:
                             # Read result directly from the worker
                             last_result = worker._last_result
@@ -1671,9 +1699,21 @@ class GraphExecutor:
 
                             # Route activations
                             for activation in outgoing_activations:
+                                self.logger.info(
+                                    "  Routing activation: %s -> %s (pending before: %s)",
+                                    activation.source_id,
+                                    activation.target_id,
+                                    list(pending_tasks.keys()),
+                                )
                                 _route_activation(
                                     activation, workers, pending_tasks,
                                     has_event_subscription=False,
+                                )
+                                self.logger.info(
+                                    "  Routed activation: %s -> %s (pending after: %s)",
+                                    activation.source_id,
+                                    activation.target_id,
+                                    list(pending_tasks.keys()),
                                 )
 
                             if wid in terminal_worker_ids:
