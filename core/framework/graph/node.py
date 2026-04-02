@@ -412,13 +412,13 @@ class DataBuffer:
         self,
         read_keys: list[str],
         write_keys: list[str],
-    ) -> "SharedMemory":
+    ) -> "DataBuffer":
         """Create a view with restricted permissions for a specific node.
 
         The scoped view shares the same underlying data and locks,
         enabling thread-safe parallel execution across scoped views.
         """
-        return SharedMemory(
+        return DataBuffer(
             _data=self._data,
             _allowed_read=set(read_keys) if read_keys else set(),
             _allowed_write=set(write_keys) if write_keys else set(),
@@ -434,7 +434,7 @@ class NodeContext:
 
     This is passed to every node and provides:
     - Access to the runtime (for decision logging)
-    - Access to shared memory (for state)
+    - Access to the data buffer (for state)
     - Access to LLM (for generation)
     - Access to tools (for actions)
     - The goal context (for guidance)
@@ -448,7 +448,7 @@ class NodeContext:
     node_spec: NodeSpec
 
     # State
-    memory: SharedMemory
+    buffer: DataBuffer
     input_data: dict[str, Any] = field(default_factory=dict)
 
     # LLM access (if applicable)
@@ -644,6 +644,6 @@ class NodeProtocol(ABC):
         """
         errors = []
         for key in ctx.node_spec.input_keys:
-            if key not in ctx.input_data and ctx.memory.read(key) is None:
+            if key not in ctx.input_data and ctx.buffer.read(key) is None:
                 errors.append(f"Missing required input: {key}")
         return errors
