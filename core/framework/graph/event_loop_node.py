@@ -306,6 +306,7 @@ class EventLoopNode(NodeProtocol):
 
     async def execute(self, ctx: NodeContext) -> NodeResult:
         """Run the event loop."""
+        logger.debug("[EventLoopNode.execute] Starting execution for node=%s, stream=%s", ctx.node_id, ctx.stream_id)
         start_time = time.time()
         total_input_tokens = 0
         total_output_tokens = 0
@@ -314,6 +315,7 @@ class EventLoopNode(NodeProtocol):
         execution_id = ctx.execution_id or ""
         # Store skill dirs for AS-9 file-read interception in _execute_tool
         self._skill_dirs: list[str] = ctx.skill_dirs
+        logger.debug("[EventLoopNode.execute] node_id=%s, execution_id=%s, max_iterations=%d", node_id, execution_id, self._config.max_iterations)
 
         # DS-13: context preservation warning state
         _context_warn_sent = False
@@ -550,8 +552,10 @@ class EventLoopNode(NodeProtocol):
         _consecutive_empty_turns: int = 0
 
         # 6. Main loop
+        logger.debug("[EventLoopNode.execute] Entering main loop, start_iteration=%d", start_iteration)
         for iteration in range(start_iteration, self._config.max_iterations):
             iter_start = time.time()
+            logger.debug("[EventLoopNode.execute] iteration=%d starting", iteration)
 
             # 6a. Check pause (no current-iteration data yet — only log_node_complete needed)
             if await self._check_pause(ctx, conversation, iteration):
@@ -582,9 +586,12 @@ class EventLoopNode(NodeProtocol):
                 )
 
             # 6b. Drain injection queue
+            logger.debug("[EventLoopNode.execute] iteration=%d: draining injection queue...", iteration)
             drained_injections = await self._drain_injection_queue(conversation, ctx)
+            logger.debug("[EventLoopNode.execute] iteration=%d: drained %d injections", iteration, drained_injections)
             # 6b1. Drain trigger queue (framework-level signals)
             drained_triggers = await self._drain_trigger_queue(conversation)
+            logger.debug("[EventLoopNode.execute] iteration=%d: drained %d triggers", iteration, drained_triggers)
 
             # Resume blocked ask_user/auto-block waits durably across restarts.
             # If the node was parked for input and no new message has been
@@ -710,12 +717,14 @@ class EventLoopNode(NodeProtocol):
                 iteration,
                 len(conversation.messages),
             )
+            logger.debug("[EventLoopNode.execute] iteration=%d: entering _run_single_turn loop", iteration)
             _stream_retry_count = 0
             _turn_cancelled = False
             _llm_turn_failed_waiting_input = False
             _turn_t0 = time.monotonic()
             while True:
                 try:
+                    logger.debug("[EventLoopNode.execute] iteration=%d: calling _run_single_turn (retry=%d)", iteration, _stream_retry_count)
                     (
                         assistant_text,
                         real_tool_results,
@@ -733,6 +742,7 @@ class EventLoopNode(NodeProtocol):
                         ctx, conversation, tools, iteration, accumulator
                     )
                     _turn_ms = int((time.monotonic() - _turn_t0) * 1000)
+                    logger.debug("[EventLoopNode.execute] iteration=%d: _run_single_turn completed successfully", iteration)
                     logger.info(
                         "[%s] iter=%d: LLM done (%dms) — text=%d chars, real_tools=%d, "
                         "outputs_set=%s, tokens=%s, accumulator=%s",
@@ -797,10 +807,12 @@ class EventLoopNode(NodeProtocol):
                     break  # success — exit retry loop
 
                 except TurnCancelled:
+                    logger.debug("[EventLoopNode.execute] iteration=%d: TurnCancelled", iteration)
                     _turn_cancelled = True
                     break
 
                 except Exception as e:
+                    logger.debug("[EventLoopNode.execute] iteration=%d: Exception in _run_single_turn: %s (%s)", iteration, type(e).__name__, str(e)[:200])
                     # Retry transient errors with exponential backoff
                     if (
                         self._is_transient_error(e)
@@ -1872,8 +1884,25 @@ class EventLoopNode(NodeProtocol):
                 message formatting in _drain_injection_queue, not wake behavior.
             image_content: Optional list of OpenAI-style image blocks to attach.
         """
-        await self._injection_queue.put((content, is_client_input, image_content))
-        self._input_ready.set()
+        logger.debug(
+            "[EventLoopNode.inject_event] content_len=%d, is_client_input=%s, has_images=%s, queue_size_before=%d",
+            len(content) if content else 0,
+            is_client_input,
+            bool(image_content),
+            self._injection_queue.qsize() if hasattr(self._injection_queue, 'qsize') else -1,
+        )
+        try:
+            await self._injection_queue.put((content, is_client_input, image_content))
+            logger.debug("[EventLoopNode.inject_event] Message queued successfully")
+        except Exception as e:
+            logger.exception("[EventLoopNode.inject_event] Failed to queue message: %s", e)
+            raise
+        try:
+            self._input_ready.set()
+            logger.debug("[EventLoopNode.inject_event] _input_ready.set() called")
+        except Exception as e:
+            logger.exception("[EventLoopNode.inject_event] Failed to set _input_ready: %s", e)
+            raise
 
     async def inject_trigger(self, trigger: TriggerEvent) -> None:
         """Inject a framework-level trigger into the running queen loop.
@@ -2032,6 +2061,7 @@ class EventLoopNode(NodeProtocol):
         # to "".  Without this, all calls share the same message ID on the
         # frontend and the second call's text silently replaces the first.
         inner_turn = 0
+        logger.debug("[_run_single_turn] node_id=%s, tools_count=%d, execution_id=%s", node_id, len(tools), execution_id)
 
         # Inner tool loop: stream may produce tool calls requiring re-invocation
         while True:
@@ -2065,6 +2095,8 @@ class EventLoopNode(NodeProtocol):
             accumulated_text = ""
             tool_calls: list[ToolCallEvent] = []
             _stream_error: StreamErrorEvent | None = None
+
+            logger.debug("[_run_single_turn] inner_turn=%d: Starting LLM stream with %d messages, %d tools", inner_turn, len(messages), len(tools))
 
             # Stream LLM response in a child task so cancel_current_turn()
             # can kill it instantly without terminating the queen's main loop.
@@ -2151,9 +2183,12 @@ class EventLoopNode(NodeProtocol):
 
             _llm_stream_t0 = time.monotonic()
             self._stream_task = asyncio.create_task(_do_stream())
+            logger.debug("[_run_single_turn] inner_turn=%d: Stream task created, waiting...", inner_turn)
             try:
                 await self._stream_task
+                logger.debug("[_run_single_turn] inner_turn=%d: Stream task completed normally", inner_turn)
             except asyncio.CancelledError:
+                logger.debug("[_run_single_turn] inner_turn=%d: Stream task cancelled", inner_turn)
                 if accumulated_text:
                     await conversation.add_assistant_message(content=accumulated_text)
                 # Distinguish cancel_current_turn() (cancels the child
@@ -2166,6 +2201,9 @@ class EventLoopNode(NodeProtocol):
                 if task and task.cancelling() > 0:
                     raise
                 raise TurnCancelled() from None
+            except Exception as e:
+                logger.exception("[_run_single_turn] inner_turn=%d: Stream task failed: %s", inner_turn, e)
+                raise
             finally:
                 self._stream_task = None
             _llm_stream_ms = int((time.monotonic() - _llm_stream_t0) * 1000)
