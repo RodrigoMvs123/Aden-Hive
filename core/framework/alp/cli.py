@@ -10,7 +10,7 @@ def register_alp_commands(subparsers: argparse._SubParsersAction) -> None:
     """Register ALP export command with the main CLI."""
     p = subparsers.add_parser(
         "export-alp",
-        help="Export a Hive agent as an ALP v0.2.2 card (agent.alp.json)",
+        help="Export a Hive agent as an ALP v0.4.0 card (agent.alp.json)",
         description=(
             "Reads a finalized Hive worker agent graph and writes an ALP-compliant "
             "agent.alp.json card to the current directory."
@@ -39,6 +39,17 @@ def register_alp_commands(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Skip schema validation after export",
     )
+    p.add_argument(
+        "--serve",
+        action="store_true",
+        help="After export, start an ALP v0.4.0 server (GET /persona, GET /agents, GET /card)",
+    )
+    p.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="Port for the ALP server (default: 8080, only used with --serve)",
+    )
     p.set_defaults(func=_cmd_export_alp)
 
 
@@ -65,4 +76,9 @@ def _cmd_export_alp(args: argparse.Namespace) -> int:
     output_path = Path(args.output)
     output_path.write_text(json.dumps(card, indent=2), encoding="utf-8")
     print(f"✓ ALP card written to: {output_path.resolve()}")
+
+    if getattr(args, "serve", False):
+        from framework.alp.server import serve_alp
+        serve_alp(card, port=args.port)
+
     return 0

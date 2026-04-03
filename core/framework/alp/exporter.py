@@ -1,6 +1,6 @@
 """ALP (Agent Load Protocol) exporter for Hive agents.
 
-Reads a finalized Hive worker agent graph and maps it to an ALP v0.2.2 card.
+Reads a finalized Hive worker agent graph and maps it to an ALP v0.4.0 card.
 """
 
 import json
@@ -13,7 +13,7 @@ from framework.config import get_hive_config
 
 logger = logging.getLogger(__name__)
 
-ALP_VERSION = "0.2.2"
+ALP_VERSION = "0.4.0"
 ALP_SCHEMA_URL = (
     "https://raw.githubusercontent.com/RodrigoMvs123/agent-load-protocol"
     "/main/schema/agent.alp.schema.json"
@@ -71,6 +71,13 @@ def _map_capabilities(agent_data: dict) -> list[str]:
     return list(dict.fromkeys(caps))  # deduplicate, preserve order
 
 
+# Read-only tools that perform no mutations
+_READONLY_TOOLS: frozenset[str] = frozenset({
+    "search_files", "read_file", "list_directory", "get_agent_info",
+    "list_agents", "get_logs", "get_session_status",
+})
+
+
 def _map_tools(agent_data: dict, server_url: str) -> list[dict]:
     """Map Hive agent nodes with tools to ALP tool definitions."""
     graph = agent_data.get("graph", {})
@@ -90,9 +97,11 @@ def _map_tools(agent_data: dict, server_url: str) -> list[dict]:
                 "name": tool_name,
                 "description": f"Hive tool: {tool_name.replace('_', ' ')}",
                 "endpoint": f"/tools/{tool_name}",
+                "readonly": tool_name in _READONLY_TOOLS,
+                "deprecated": False,
+                "auth": {"type": "none"},
             })
 
-    # Also include required_tools not already covered
     for tool_name in required_tools:
         if tool_name not in seen:
             seen.add(tool_name)
@@ -100,9 +109,48 @@ def _map_tools(agent_data: dict, server_url: str) -> list[dict]:
                 "name": tool_name,
                 "description": f"Hive tool: {tool_name.replace('_', ' ')}",
                 "endpoint": f"/tools/{tool_name}",
+                "readonly": tool_name in _READONLY_TOOLS,
+                "deprecated": False,
+                "auth": {"type": "none"},
             })
 
     return alp_tools
+
+
+def _map_triggers(agent_data: dict) -> list[dict]:
+    """Derive ALP triggers from the agent graph definition."""
+    graph = agent_data.get("graph", {})
+    triggers = []
+
+    # Hive supports schedulers and webhooks as entry points
+    entry_points = graph.get("entry_points", {})
+    for ep_name in entry_points:
+        if "schedule" in ep_name.lower() or "cron" in ep_name.lower():
+            triggers.append({"type": "schedule", "config": {}})
+        elif "webhook" in ep_name.lower():
+            triggers.append({"type": "webhook", "config": {}})
+
+    if not triggers:
+        triggers.append({"type": "manual", "config": {}})
+
+    return triggers
+
+
+def _map_toolsets(agent_data: dict) -> dict:
+    """Build ALP toolsets from agent node tool groupings."""
+    graph = agent_data.get("graph", {})
+    nodes = graph.get("nodes", [])
+
+    groups: dict[str, list[str]] = {"default": []}
+    seen: set[str] = set()
+
+    for node in nodes:
+        for tool_name in node.get("tools", []):
+            if tool_name not in seen:
+                seen.add(tool_name)
+                groups["default"].append(tool_name)
+
+    return {"groups": groups, "active": "default"}
 
 
 def _load_agent_data(agent_path: Path) -> dict:
@@ -188,6 +236,10 @@ def export_alp_card(
         "connections": [],
     }
 
+    # Toolsets and triggers
+    toolsets = _map_toolsets(agent_data)
+    triggers = _map_triggers(agent_data)
+
     card: dict[str, Any] = {
         "alp_version": ALP_VERSION,
         "id": _slugify(name),
@@ -200,7 +252,22 @@ def export_alp_card(
             "provider": alp_provider,
             "model": alp_model,
         },
+        "toolsets": toolsets,
+        "tools_discovery": {
+            "enabled": False,
+            "mode": "static",
+        },
+        "security": {
+            "read_only": False,
+            "lockdown_mode": False,
+            "max_tool_retries": 5,
+        },
         "tools": tools,
+        "triggers": triggers,
+        "bulk_schedule": {
+            "enabled": False,
+            "concurrency": 1,
+        },
         "memory": {
             "enabled": True,
             "backend": "hive-internal",
@@ -228,12 +295,18 @@ def export_alp_card(
         "server": {
             "url": server_url,
             "transport": "websocket",
+            "channel": "stable",
+            "modes": {
+                "read_only": False,
+                "lockdown": False,
+            },
         },
         "marketplace": {
             "category": "automation",
             "tags": ["hive", agent_id.replace("_", "-")],
             "pricing_model": "per-run",
         },
+        "variables": {},
         "metadata": {
             "author": "",
             "version": agent_meta.get("version", "1.0.0"),
