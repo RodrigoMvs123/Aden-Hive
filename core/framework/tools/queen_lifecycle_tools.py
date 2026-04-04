@@ -128,6 +128,11 @@ class QueenPhaseState:
     # Community skills catalog (XML) — appended after protocols
     skills_catalog_prompt: str = ""
 
+    # Persona and communication style (set once at session start by persona hook,
+    # persisted here so they survive dynamic prompt refreshes across iterations).
+    persona_prefix: str = ""  # e.g. "You are a CFO. I am a CFO with 20 years..."
+    style_directive: str = ""  # e.g. "## Communication Style: Peer\n\n..."
+
     # Cached recall block — populated async by recall_selector after each turn.
     _cached_recall_block: str = ""
     _cached_colony_recall_block: str = ""
@@ -159,7 +164,15 @@ class QueenPhaseState:
         else:
             base = self.prompt_building
 
-        parts = [base]
+        from framework.agents.queen.queen_memory import format_for_injection
+
+        _memory = format_for_injection()  # noqa: F841
+        parts = []
+        if self.persona_prefix:
+            parts.append(self.persona_prefix)
+        parts.append(base)
+        if self.style_directive:
+            parts.append(self.style_directive)
         if self.skills_catalog_prompt:
             parts.append(self.skills_catalog_prompt)
         if self.protocols_prompt:
@@ -1117,9 +1130,7 @@ def register_queen_lifecycle_tools(
         ),
         parameters={"type": "object", "properties": {}},
     )
-    registry.register(
-        "stop_graph_and_edit", _stop_edit_tool, lambda inputs: stop_graph_and_edit()
-    )
+    registry.register("stop_graph_and_edit", _stop_edit_tool, lambda inputs: stop_graph_and_edit())
     tools_registered += 1
 
     # --- stop_graph_and_plan (Running/Staging → Planning) ---------------------
@@ -1151,9 +1162,7 @@ def register_queen_lifecycle_tools(
         ),
         parameters={"type": "object", "properties": {}},
     )
-    registry.register(
-        "stop_graph_and_plan", _stop_plan_tool, lambda inputs: stop_graph_and_plan()
-    )
+    registry.register("stop_graph_and_plan", _stop_plan_tool, lambda inputs: stop_graph_and_plan())
     tools_registered += 1
 
     # --- replan_agent (Building → Planning) -----------------------------------
@@ -3208,9 +3217,7 @@ def register_queen_lifecycle_tools(
                 "focus": {
                     "type": "string",
                     "enum": ["activity", "memory", "tools", "issues", "progress", "full"],
-                    "description": (
-                        "Aspect to inspect. Omit for a brief summary."
-                    ),
+                    "description": ("Aspect to inspect. Omit for a brief summary."),
                 },
                 "last_n": {
                     "type": "integer",
@@ -3297,9 +3304,7 @@ def register_queen_lifecycle_tools(
             "required": ["content"],
         },
     )
-    registry.register(
-        "inject_message", _inject_tool, lambda inputs: inject_message(**inputs)
-    )
+    registry.register("inject_message", _inject_tool, lambda inputs: inject_message(**inputs))
     tools_registered += 1
 
     # --- list_credentials -----------------------------------------------------

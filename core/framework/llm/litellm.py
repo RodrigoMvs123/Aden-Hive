@@ -464,7 +464,7 @@ def _is_stream_transient_error(exc: BaseException) -> bool:
 
 def _extract_text_tool_calls(
     text: str,
-) -> tuple[list["ToolCallEvent"], str]:
+) -> tuple[list, str]:
     """Extract hallucinated tool calls from ``<tool_code>`` blocks in LLM text.
 
     Some models (notably Gemini) emit tool invocations as text instead of using
@@ -498,7 +498,9 @@ def _extract_text_tool_calls(
             continue
 
         for tool_name, tool_args in payload.items():
-            call_id = f"synth_{hashlib.md5(f'{tool_name}:{json.dumps(tool_args, sort_keys=True)}'.encode()).hexdigest()[:12]}"
+            key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
+            digest = hashlib.md5(key.encode()).hexdigest()[:12]
+            call_id = f"synth_{digest}"
             events.append(
                 ToolCallEvent(
                     tool_use_id=call_id,
@@ -2032,12 +2034,15 @@ class LiteLLMProvider(LLMProvider):
                 # tail_events before the error, the stream was successful —
                 # yield what we have instead of discarding it.
                 if (accumulated_text or tool_calls_acc) and tail_events:
+                    # LiteLLM may wrap the original ValidationError in an
+                    # APIError with a different message.  Check the full
+                    # exception chain (str(e) + str(__cause__)).
                     _err_chain = f"{e} {e.__cause__}" if e.__cause__ else str(e)
                     _is_finish_reason_err = (
                         "finish_reason" in _err_chain and "validation error" in _err_chain.lower()
                     ) or (
-                        "building chunks" in str(e).lower()
-                        and (accumulated_text or tool_calls_acc)
+                        # Fallback: the APIError wrapper message for chunk-building failures
+                        "building chunks" in str(e).lower() and (accumulated_text or tool_calls_acc)
                     )
                     if _is_finish_reason_err:
                         logger.warning(
