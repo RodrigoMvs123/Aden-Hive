@@ -28,7 +28,7 @@ def register_advanced_tools(mcp: FastMCP) -> None:
         text: str | None = None,
         tab_id: int | None = None,
         profile: str | None = None,
-        timeout_ms: int = 30000,
+        timeout_ms: int = 5000,
     ) -> dict:
         """
         Wait for a condition.
@@ -39,7 +39,13 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             text: Wait for text to appear on page (optional)
             tab_id: Chrome tab ID (default: active tab)
             profile: Browser profile name (default: "default")
-            timeout_ms: Max wait time in ms (default: 30000)
+            timeout_ms: Max wait time in ms for the selector/text poll.
+                Default 5000ms (fast-fail). If the condition isn't met
+                within 5s the call returns {"ok": False, "error": ...}
+                and the agent can try a different approach instead of
+                burning 30s per miss. Pass a larger value (e.g. 15000)
+                only when you genuinely expect the element to take
+                longer than 5s to render.
 
         Returns:
             Dict with wait result
@@ -90,15 +96,59 @@ def register_advanced_tools(mcp: FastMCP) -> None:
         profile: str | None = None,
     ) -> dict:
         """
-        Execute JavaScript in the browser context.
+        ESCAPE HATCH — execute raw JavaScript. USE ONLY as a last
+        resort. 99% of browser automation does NOT need this tool.
+        Before reaching for it, try a semantic tool first:
+
+          - browser_click / browser_click_coordinate  → for clicks
+          - browser_type(use_insert_text=True)        → for text input
+          - browser_screenshot + browser_get_rect     → for locating elements
+          - browser_shadow_query                      → for shadow-DOM selectors
+          - browser_get_text / browser_get_attribute  → for reading state
+
+        ANTI-PATTERNS — stop and switch tools if you notice yourself:
+
+          1. Calling browser_evaluate 2+ times in a row to guess at
+             selectors. Each attempt costs ~30 tokens of JS + a full
+             LLM round-trip. After 2 empty results, the selector
+             strategy is wrong — pivot to browser_screenshot +
+             browser_click_coordinate. The screenshot + coord path
+             works on shadow DOM, iframes, and React-obfuscated
+             class names indifferently.
+
+          2. Writing a walk(root) recursive shadow-DOM traversal
+             function. Use browser_shadow_query — it does the
+             traversal in C++ via CDP's querySelector, not in JS.
+
+          3. Calling document.execCommand('insertText', ...) to type
+             into Lexical / contenteditable. Use
+             browser_type(use_insert_text=True, text='...') instead.
+             It handles the click-then-focus-then-insert sequence
+             with built-in retries.
+
+          4. Trying to read a nested iframe's contentDocument. That
+             usually fails (cross-origin or late hydration). Use
+             browser_screenshot to see it, then browser_click_coordinate.
+
+        LEGITIMATE uses (when nothing semantic fits):
+
+          - Reading a computed style, window size, or scroll position
+            that no tool exposes.
+          - Firing a one-shot site-specific API call (e.g. an analytics
+            beacon the test needs).
+          - Stripping an onbeforeunload handler that blocks navigation.
+          - Probing for shadow roots whose existence is conditional.
 
         Args:
-            script: JavaScript code to execute
+            script: JavaScript code to execute. Keep it small. If you
+                need to traverse the DOM, prefer browser_shadow_query.
             tab_id: Chrome tab ID (default: active tab)
             profile: Browser profile name (default: "default")
 
         Returns:
-            Dict with evaluation result
+            Dict with evaluation result. On a "find X" script that
+            returns [] or null: do NOT retry with a different
+            selector — take a screenshot and switch to coordinates.
         """
         bridge = get_bridge()
         if not bridge or not bridge.is_connected:
@@ -113,6 +163,28 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             return {"ok": False, "error": "No active tab"}
 
         try:
+            # Show a brief toast in the browser so the user sees JS executing
+            snippet = script.strip().replace("'", "\\'")[:80]
+            toast_js = f"""
+            (function(){{
+              var old=document.getElementById('__hive_toast');if(old)old.remove();
+              var t=document.createElement('div');t.id='__hive_toast';
+              t.style.cssText='position:fixed;z-index:2147483647;top:12px;right:12px;'
+                +'background:rgba(30,30,30,0.9);color:#a5d6ff;font:12px/18px monospace;'
+                +'padding:8px 14px;border-radius:6px;max-width:420px;pointer-events:none;'
+                +'white-space:pre-wrap;word-break:break-all;transition:opacity 0.4s;opacity:1;'
+                +'border:1px solid rgba(59,130,246,0.4);box-shadow:0 4px 12px rgba(0,0,0,0.3);';
+              t.textContent='\\u25b6 '+'{snippet}';
+              document.documentElement.appendChild(t);
+              setTimeout(function(){{t.style.opacity='0';}},2000);
+              setTimeout(function(){{t.remove();}},2500);
+            }})();
+            """
+            try:
+                await bridge.evaluate(target_tab, toast_js)
+            except Exception:
+                pass
+
             result = await bridge.evaluate(target_tab, script)
             return result
         except Exception as e:
@@ -189,9 +261,7 @@ def register_advanced_tools(mcp: FastMCP) -> None:
             return {"ok": False, "error": "No active tab"}
 
         try:
-            result = await bridge.get_attribute(
-                target_tab, selector, attribute, timeout_ms=timeout_ms
-            )
+            result = await bridge.get_attribute(target_tab, selector, attribute, timeout_ms=timeout_ms)
             return result
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -229,6 +299,17 @@ def register_advanced_tools(mcp: FastMCP) -> None:
 
         try:
             result = await bridge.resize(target_tab, width, height)
+            # Invalidate per-tab scale caches — CSS width changed, so the
+            # cached viewport dimensions are stale. Click / rect tools
+            # will re-query innerWidth / innerHeight on next use via
+            # _ensure_viewport_size.
+            try:
+                from .inspection import _screenshot_scales, _viewport_sizes
+
+                _viewport_sizes.pop(target_tab, None)
+                _screenshot_scales.pop(target_tab, None)
+            except Exception:
+                pass
             return result
         except Exception as e:
             return {"ok": False, "error": str(e)}

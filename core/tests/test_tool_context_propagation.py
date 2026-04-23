@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import pytest
 
-from framework.graph.event_loop.tool_result_handler import execute_tool
+from framework.agent_loop.internals.tool_result_handler import execute_tool
 from framework.llm.provider import ToolResult, ToolUse
-from framework.runner.tool_registry import _execution_context
+from framework.loader.tool_registry import _execution_context
 
 
 class _ToolCallEvent:
@@ -57,8 +57,7 @@ async def test_execution_context_propagates_to_tool_executor() -> None:
 
     assert result.content == "ok"
     assert captured["exec_ctx"] is not None, (
-        "execution context was None inside worker thread, "
-        "contextvars did not propagate through run_in_executor"
+        "execution context was None inside worker thread, contextvars did not propagate through run_in_executor"
     )
     assert captured["exec_ctx"]["data_dir"] == "/tmp/test_data"
 

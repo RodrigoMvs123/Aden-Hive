@@ -27,6 +27,15 @@ class Tool:
     name: str
     description: str
     parameters: dict[str, Any] = field(default_factory=dict)
+    # If True, the tool may return ImageContent in its result. Text-only models
+    # (e.g. glm-5, deepseek-chat) have this hidden from their schema entirely.
+    produces_image: bool = False
+    # If True, this tool performs no filesystem/process/network writes and is
+    # safe to run concurrently with other safe-flagged tools inside the same
+    # assistant turn. Unsafe tools (writes, shell, browser actions) are always
+    # serialized after the safe batch. Default False - the conservative choice
+    # when a tool's behavior isn't explicitly vetted.
+    concurrency_safe: bool = False
 
 
 @dataclass
@@ -101,19 +110,30 @@ class LLMProvider(ABC):
         response_format: dict[str, Any] | None = None,
         json_mode: bool = False,
         max_retries: int | None = None,
+        system_dynamic_suffix: str | None = None,
     ) -> "LLMResponse":
         """Async version of complete(). Non-blocking on the event loop.
 
         Default implementation offloads the sync complete() to a thread pool.
         Subclasses SHOULD override for native async I/O.
+
+        ``system_dynamic_suffix`` is an optional per-turn tail for providers
+        that honor ``cache_control`` (see LiteLLMProvider for semantics).
+        The default implementation concatenates it onto ``system`` since the
+        sync ``complete()`` path does not support the split.
         """
+        combined_system = system
+        if system_dynamic_suffix:
+            combined_system = (
+                f"{system}\n\n{system_dynamic_suffix}" if system else system_dynamic_suffix
+            )
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             partial(
                 self.complete,
                 messages=messages,
-                system=system,
+                system=combined_system,
                 tools=tools,
                 max_tokens=max_tokens,
                 response_format=response_format,
@@ -128,6 +148,7 @@ class LLMProvider(ABC):
         system: str = "",
         tools: list[Tool] | None = None,
         max_tokens: int = 4096,
+        system_dynamic_suffix: str | None = None,
     ) -> AsyncIterator["StreamEvent"]:
         """
         Stream a completion as an async iterator of StreamEvents.
@@ -138,6 +159,9 @@ class LLMProvider(ABC):
         Tool orchestration is the CALLER's responsibility:
         - Caller detects ToolCallEvent, executes tool, adds result
           to messages, calls stream() again.
+
+        ``system_dynamic_suffix`` is forwarded to ``acomplete``; see its
+        docstring for the two-block split semantics.
         """
         from framework.llm.stream_events import (
             FinishEvent,
@@ -150,6 +174,7 @@ class LLMProvider(ABC):
             system=system,
             tools=tools,
             max_tokens=max_tokens,
+            system_dynamic_suffix=system_dynamic_suffix,
         )
         yield TextDeltaEvent(content=response.content, snapshot=response.content)
         yield TextEndEvent(full_text=response.content)

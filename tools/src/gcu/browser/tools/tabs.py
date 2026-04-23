@@ -1,5 +1,5 @@
 """
-Browser tab management tools - tabs, open, close, focus.
+Browser tab management tools - tabs, open, close, activate.
 
 All operations go through the Beeline extension - no Playwright required.
 """
@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import Annotated, Any
 
 from fastmcp import FastMCP
+from pydantic import Field
 
 from ..bridge import get_bridge
 from ..session import _active_profile
@@ -87,9 +88,7 @@ def register_tab_tools(mcp: FastMCP) -> None:
             return result
         except Exception as e:
             result = {"ok": False, "error": str(e)}
-            log_tool_call(
-                "browser_tabs", params, error=e, duration_ms=(time.perf_counter() - start) * 1000
-            )
+            log_tool_call("browser_tabs", params, error=e, duration_ms=(time.perf_counter() - start) * 1000)
             return result
 
     @mcp.tool()
@@ -128,9 +127,18 @@ def register_tab_tools(mcp: FastMCP) -> None:
             return result
 
         try:
-            # Create tab in the group
-            result = await bridge.create_tab(url=url, group_id=ctx.get("groupId"))
-            tab_id = result.get("tabId")
+            # Reuse the seed about:blank tab from context.create on first open
+            seed_tab = ctx.pop("_seedTabId", None)
+            if seed_tab is not None:
+                tab_id = seed_tab
+            else:
+                result = await bridge.create_tab(url=url, group_id=ctx.get("groupId"))
+                tab_id = result.get("tabId")
+
+            # Track tab_ids so browser_stop can clear per-tab caches
+            # for every tab in this profile at once.
+            if tab_id is not None:
+                ctx.setdefault("tabs", set()).add(tab_id)
 
             # Update active tab if not background
             if not background and tab_id is not None:
@@ -156,9 +164,7 @@ def register_tab_tools(mcp: FastMCP) -> None:
             return result
         except Exception as e:
             result = {"ok": False, "error": str(e)}
-            log_tool_call(
-                "browser_open", params, error=e, duration_ms=(time.perf_counter() - start) * 1000
-            )
+            log_tool_call("browser_open", params, error=e, duration_ms=(time.perf_counter() - start) * 1000)
             return result
 
     @mcp.tool()
@@ -201,6 +207,12 @@ def register_tab_tools(mcp: FastMCP) -> None:
         try:
             await bridge.close_tab(target_tab)
 
+            # Forget the closed tab so ctx["tabs"] only reflects tabs
+            # that could still get per-tab cache activity.
+            tabs_set = ctx.get("tabs")
+            if isinstance(tabs_set, set):
+                tabs_set.discard(target_tab)
+
             # Update active tab if we closed it
             if ctx.get("activeTabId") == target_tab:
                 result = await bridge.list_tabs(ctx.get("groupId"))
@@ -217,22 +229,37 @@ def register_tab_tools(mcp: FastMCP) -> None:
             return result
         except Exception as e:
             result = {"ok": False, "error": str(e)}
-            log_tool_call(
-                "browser_close", params, error=e, duration_ms=(time.perf_counter() - start) * 1000
-            )
+            log_tool_call("browser_close", params, error=e, duration_ms=(time.perf_counter() - start) * 1000)
             return result
 
     @mcp.tool()
-    async def browser_focus(tab_id: int, profile: str | None = None) -> dict:
+    async def browser_activate_tab(
+        tab_id: Annotated[
+            int,
+            Field(
+                description=(
+                    "REQUIRED. Integer Chrome tab ID of the tab to switch to. "
+                    "Must be a concrete integer (not null). "
+                    "Call browser_tabs first to list available tabs and their IDs."
+                ),
+            ),
+        ],
+        profile: str | None = None,
+    ) -> dict:
         """
-        Focus a browser tab.
+        Switch the active browser tab to the given tab ID.
+
+        Use this to bring an existing tab to the foreground before interacting
+        with it. The ``tab_id`` argument is required and must be an integer
+        returned by ``browser_tabs``; passing null/None is not supported (use
+        ``browser_tabs`` to discover a valid ID first).
 
         Args:
-            tab_id: Chrome tab ID to focus
+            tab_id: Chrome tab ID to activate. Required integer.
             profile: Browser profile name (default: "default")
 
         Returns:
-            Dict with focus status
+            Dict with activation status
         """
         start = time.perf_counter()
         params = {"tab_id": tab_id, "profile": profile}
@@ -240,13 +267,13 @@ def register_tab_tools(mcp: FastMCP) -> None:
         bridge = get_bridge()
         if not bridge or not bridge.is_connected:
             result = {"ok": False, "error": "Browser extension not connected"}
-            log_tool_call("browser_focus", params, result=result)
+            log_tool_call("browser_activate_tab", params, result=result)
             return result
 
         ctx = _get_context(profile)
         if not ctx:
             result = {"ok": False, "error": "Browser not started. Call browser_start first."}
-            log_tool_call("browser_focus", params, result=result)
+            log_tool_call("browser_activate_tab", params, result=result)
             return result
 
         try:
@@ -254,7 +281,7 @@ def register_tab_tools(mcp: FastMCP) -> None:
             ctx["activeTabId"] = tab_id
             result = {"ok": True, "tabId": tab_id}
             log_tool_call(
-                "browser_focus",
+                "browser_activate_tab",
                 params,
                 result=result,
                 duration_ms=(time.perf_counter() - start) * 1000,
@@ -263,7 +290,10 @@ def register_tab_tools(mcp: FastMCP) -> None:
         except Exception as e:
             result = {"ok": False, "error": str(e)}
             log_tool_call(
-                "browser_focus", params, error=e, duration_ms=(time.perf_counter() - start) * 1000
+                "browser_activate_tab",
+                params,
+                error=e,
+                duration_ms=(time.perf_counter() - start) * 1000,
             )
             return result
 
@@ -304,6 +334,7 @@ def register_tab_tools(mcp: FastMCP) -> None:
             active_tab_id = ctx.get("activeTabId")
 
             closed = 0
+            tabs_set = ctx.get("tabs") if isinstance(ctx.get("tabs"), set) else None
             for tab in tabs:
                 tid = tab.get("id")
                 if keep_active and tid == active_tab_id:
@@ -311,6 +342,8 @@ def register_tab_tools(mcp: FastMCP) -> None:
                 try:
                     await bridge.close_tab(tid)
                     closed += 1
+                    if tabs_set is not None and tid is not None:
+                        tabs_set.discard(tid)
                 except Exception:
                     pass
 

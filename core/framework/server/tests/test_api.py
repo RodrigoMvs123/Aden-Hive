@@ -14,7 +14,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from framework.runtime.triggers import TriggerDefinition
+from framework.host.execution_manager import ExecutionAlreadyRunningError
+from framework.host.triggers import TriggerDefinition
+from framework.llm.model_catalog import get_models_catalogue
+from framework.server import (
+    routes_messages,
+    routes_queens,
+    session_manager as session_manager_module,
+)
 from framework.server.app import create_app
 from framework.server.session_manager import Session
 
@@ -83,8 +90,8 @@ class MockStream:
     _active_executors: dict = field(default_factory=dict)
     active_execution_ids: set = field(default_factory=set)
 
-    async def cancel_execution(self, execution_id: str, reason: str | None = None) -> bool:
-        return execution_id in self._execution_tasks
+    async def cancel_execution(self, execution_id: str, reason: str | None = None) -> str:
+        return "cancelled" if execution_id in self._execution_tasks else "not_found"
 
 
 @dataclass
@@ -111,8 +118,8 @@ class MockRuntime:
     def list_graphs(self):
         return ["primary"]
 
-    def get_graph_registration(self, graph_id):
-        if graph_id == "primary":
+    def get_graph_registration(self, colony_id):
+        if colony_id == "primary":
             return self._registration
         return None
 
@@ -186,10 +193,10 @@ def _make_session(
         llm=mock_llm,
         loaded_at=1000000.0,
         queen_executor=queen_executor,
-        graph_id=agent_id,
+        colony_id=agent_id,
         worker_path=agent_path,
         runner=runner,
-        graph_runtime=rt,
+        colony_runtime=rt,
         worker_info=MockAgentInfo(),
     )
 
@@ -253,15 +260,11 @@ def _write_sample_session(base: Path, session_id: str):
     conv_dir = session_dir / "conversations" / "node_a" / "parts"
     conv_dir.mkdir(parents=True)
     (conv_dir / "0001.json").write_text(json.dumps({"seq": 1, "role": "user", "content": "hello"}))
-    (conv_dir / "0002.json").write_text(
-        json.dumps({"seq": 2, "role": "assistant", "content": "hi there"})
-    )
+    (conv_dir / "0002.json").write_text(json.dumps({"seq": 2, "role": "assistant", "content": "hi there"}))
 
     conv_dir_b = session_dir / "conversations" / "node_b" / "parts"
     conv_dir_b.mkdir(parents=True)
-    (conv_dir_b / "0003.json").write_text(
-        json.dumps({"seq": 3, "role": "user", "content": "continue"})
-    )
+    (conv_dir_b / "0003.json").write_text(json.dumps({"seq": 3, "role": "user", "content": "continue"}))
 
     # Logs
     logs_dir = session_dir / "logs"
@@ -285,15 +288,30 @@ def _write_sample_session(base: Path, session_id: str):
         "attention_reasons": ["retried"],
         "total_steps": 1,
     }
-    (logs_dir / "details.jsonl").write_text(
-        json.dumps(detail_a) + "\n" + json.dumps(detail_b) + "\n"
-    )
+    (logs_dir / "details.jsonl").write_text(json.dumps(detail_a) + "\n" + json.dumps(detail_b) + "\n")
 
     step_a = {"node_id": "node_a", "step_index": 0, "llm_text": "thinking..."}
     step_b = {"node_id": "node_b", "step_index": 0, "llm_text": "retrying..."}
     (logs_dir / "tool_logs.jsonl").write_text(json.dumps(step_a) + "\n" + json.dumps(step_b) + "\n")
 
     return session_id, session_dir, state
+
+
+def _write_queen_session(tmp_path: Path, queen_id: str, session_id: str, meta: dict | None = None) -> Path:
+    """Create a persisted queen session directory for restore tests."""
+    session_dir = tmp_path / ".hive" / "agents" / "queens" / queen_id / "sessions" / session_id
+    session_dir.mkdir(parents=True)
+    if meta is not None:
+        (session_dir / "meta.json").write_text(json.dumps(meta))
+    return session_dir
+
+
+def _patch_queen_storage(monkeypatch, tmp_path: Path) -> Path:
+    """Point queen storage helpers at the test hive home."""
+    queens_dir = tmp_path / ".hive" / "agents" / "queens"
+    monkeypatch.setattr(routes_queens, "QUEENS_DIR", queens_dir)
+    monkeypatch.setattr(session_manager_module, "QUEENS_DIR", queens_dir)
+    return queens_dir
 
 
 @pytest.fixture
@@ -369,9 +387,7 @@ class TestSessionCRUD:
     async def test_create_session_with_worker_forwards_session_id(self):
         app = create_app()
         manager = app["manager"]
-        manager.create_session_with_worker_graph = AsyncMock(
-            return_value=_make_session(agent_id="my-custom-session")
-        )
+        manager.create_session_with_worker_colony = AsyncMock(return_value=_make_session(agent_id="my-custom-session"))
 
         async with TestClient(TestServer(app)) as client:
             resp = await client.post(
@@ -385,13 +401,16 @@ class TestSessionCRUD:
 
         assert resp.status == 201
         assert data["session_id"] == "my-custom-session"
-        manager.create_session_with_worker_graph.assert_awaited_once_with(
+        manager.create_session_with_worker_colony.assert_awaited_once_with(
             str(EXAMPLE_AGENT_PATH.resolve()),
             agent_id=None,
             session_id="my-custom-session",
             model=None,
             initial_prompt=None,
             queen_resume_from=None,
+            queen_name=None,
+            initial_phase=None,
+            worker_name=None,
         )
 
     @pytest.mark.asyncio
@@ -553,6 +572,201 @@ class TestSessionCRUD:
             assert resp.status == 400
 
 
+class TestMessageBootstrap:
+    @pytest.mark.asyncio
+    async def test_classify_requires_non_empty_message(self):
+        app = create_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/messages/classify", json={"message": "   "})
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_classify_returns_queen_id_without_touching_sessions(self, monkeypatch):
+        app = create_app()
+        manager = app["manager"]
+        # Pre-existing live session must NOT be stopped by classify.
+        existing = _make_session(agent_id="live_session")
+        existing.queen_name = "queen_growth"
+        manager._sessions[existing.id] = existing
+        manager.build_llm = MagicMock(return_value=MagicMock())
+        manager.stop_session = AsyncMock()
+        manager.create_session = AsyncMock()
+        monkeypatch.setattr(routes_messages, "select_queen", AsyncMock(return_value="queen_technology"))
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/messages/classify", json={"message": "Build me a scraper"})
+            assert resp.status == 200
+            data = await resp.json()
+            # Assert inside the async-with so app shutdown (which stops
+            # sessions as cleanup) doesn't pollute the assertions.
+            assert data == {"queen_id": "queen_technology"}
+            routes_messages.select_queen.assert_awaited_once()
+            manager.stop_session.assert_not_awaited()
+            manager.create_session.assert_not_awaited()
+            assert "live_session" in manager._sessions
+
+
+class TestQueenSessionSelection:
+    @pytest.mark.asyncio
+    async def test_select_queen_session_rejects_foreign_session(self, monkeypatch, tmp_path):
+        _patch_queen_storage(monkeypatch, tmp_path)
+        _write_queen_session(tmp_path, "queen_growth", "other_session", {"queen_id": "queen_growth"})
+
+        app = create_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/queen/queen_technology/session/select",
+                json={"session_id": "other_session"},
+            )
+            assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_select_queen_session_returns_live_session_without_duplication(self):
+        app = create_app()
+        manager = app["manager"]
+        target = _make_session(agent_id="queen_live")
+        target.queen_name = "queen_technology"
+        other = _make_session(agent_id="other_live")
+        other.queen_name = "queen_growth"
+        manager._sessions[target.id] = target
+        manager._sessions[other.id] = other
+        manager.stop_session = AsyncMock(side_effect=lambda sid: manager._sessions.pop(sid, None))
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/queen/queen_technology/session/select",
+                json={"session_id": "queen_live"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            # Assert inside the async-with so app shutdown (which stops
+            # remaining sessions as cleanup) doesn't pollute the assertions.
+            assert data == {
+                "session_id": "queen_live",
+                "queen_id": "queen_technology",
+                "status": "live",
+            }
+            # Other queen's live session must be left running so multiple
+            # queens can stay active in parallel across navigation.
+            manager.stop_session.assert_not_awaited()
+            assert "other_live" in manager._sessions
+
+    @pytest.mark.asyncio
+    async def test_select_queen_session_restores_specific_history_session(self, monkeypatch, tmp_path):
+        _patch_queen_storage(monkeypatch, tmp_path)
+        _write_queen_session(
+            tmp_path,
+            "queen_technology",
+            "queen_history",
+            {"queen_id": "queen_technology"},
+        )
+
+        app = create_app()
+        manager = app["manager"]
+        manager.stop_session = AsyncMock()
+        restored = _make_session(agent_id="queen_history", with_queen=False)
+        restored.queen_name = "queen_technology"
+        manager.create_session = AsyncMock(return_value=restored)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/queen/queen_technology/session/select",
+                json={"session_id": "queen_history"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data == {
+            "session_id": "queen_history",
+            "queen_id": "queen_technology",
+            "status": "resumed",
+        }
+        manager.create_session.assert_awaited_once_with(
+            queen_resume_from="queen_history",
+            initial_prompt=None,
+            queen_name="queen_technology",
+            initial_phase="independent",
+        )
+
+    @pytest.mark.asyncio
+    async def test_select_queen_session_restores_worker_backed_history(self, monkeypatch, tmp_path):
+        _patch_queen_storage(monkeypatch, tmp_path)
+        _write_queen_session(
+            tmp_path,
+            "queen_technology",
+            "worker_history",
+            {
+                "queen_id": "queen_technology",
+                "agent_path": str(EXAMPLE_AGENT_PATH),
+            },
+        )
+
+        app = create_app()
+        manager = app["manager"]
+        manager.stop_session = AsyncMock()
+        restored = _make_session(agent_id="worker_history", with_queen=False)
+        restored.queen_name = "queen_technology"
+        manager.create_session_with_worker_colony = AsyncMock(return_value=restored)
+        manager.create_session = AsyncMock()
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/queen/queen_technology/session/select",
+                json={"session_id": "worker_history"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data == {
+            "session_id": "worker_history",
+            "queen_id": "queen_technology",
+            "status": "resumed",
+        }
+        manager.create_session_with_worker_colony.assert_awaited_once_with(
+            str(EXAMPLE_AGENT_PATH.resolve()),
+            queen_resume_from="worker_history",
+            initial_prompt=None,
+            queen_name="queen_technology",
+            initial_phase=None,
+        )
+        manager.create_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_new_queen_session_creates_fresh_thread(self):
+        app = create_app()
+        manager = app["manager"]
+        existing = _make_session(agent_id="old_live")
+        existing.queen_name = "queen_growth"
+        manager._sessions[existing.id] = existing
+        manager.stop_session = AsyncMock(side_effect=lambda sid: manager._sessions.pop(sid, None))
+        created = _make_session(agent_id="fresh_thread", with_queen=False)
+        created.queen_name = "queen_technology"
+        manager.create_session = AsyncMock(return_value=created)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/queen/queen_technology/session/new",
+                json={"initial_phase": "independent"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            # Assert inside the async-with so app shutdown (which stops
+            # remaining sessions as cleanup) doesn't pollute the assertions.
+            assert data == {
+                "session_id": "fresh_thread",
+                "queen_id": "queen_technology",
+                "status": "created",
+            }
+            # Other queen's live session must be left running.
+            manager.stop_session.assert_not_awaited()
+            assert "old_live" in manager._sessions
+            manager.create_session.assert_awaited_once_with(
+                initial_prompt=None,
+                queen_name="queen_technology",
+                initial_phase="independent",
+            )
+
+
 class TestExecution:
     @pytest.mark.asyncio
     async def test_trigger(self):
@@ -566,6 +780,21 @@ class TestExecution:
             assert resp.status == 200
             data = await resp.json()
             assert data["execution_id"] == "exec_test_123"
+
+    @pytest.mark.asyncio
+    async def test_trigger_returns_409_when_execution_still_running(self):
+        session = _make_session()
+        session.colony_runtime.trigger = AsyncMock(side_effect=ExecutionAlreadyRunningError("default", ["session-1"]))
+        app = _make_app_with_session(session)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/sessions/test_agent/trigger",
+                json={"entry_point_id": "default", "input_data": {"msg": "hi"}},
+            )
+            assert resp.status == 409
+            data = await resp.json()
+            assert data["stream_id"] == "default"
+            assert data["active_execution_ids"] == ["session-1"]
 
     @pytest.mark.asyncio
     async def test_trigger_not_found(self):
@@ -643,7 +872,7 @@ class TestExecution:
     async def test_chat_prefers_queen_even_when_node_waiting(self):
         """When the queen is alive, /chat routes to queen even if a node is waiting."""
         session = _make_session()
-        session.graph_runtime.find_awaiting_node = lambda: ("chat_node", "primary")
+        session.colony_runtime.find_awaiting_node = lambda: ("chat_node", "primary")
         app = _make_app_with_session(session)
         async with TestClient(TestServer(app)) as client:
             resp = await client.post(
@@ -705,6 +934,7 @@ class TestExecution:
             data = await resp.json()
             assert data["stopped"] is False
             assert data["cancelled"] == []
+            assert data["cancelling"] == []
             assert data["timers_paused"] is True
 
     @pytest.mark.asyncio
@@ -759,7 +989,7 @@ class TestResume:
         tmp_path, agent_name, base = tmp_agent_dir
 
         session = _make_session(tmp_dir=tmp_path / ".hive" / "agents" / agent_name)
-        session.graph_runtime.trigger = AsyncMock(return_value="exec_test_123")
+        session.colony_runtime.trigger = AsyncMock(return_value="exec_test_123")
         app = _make_app_with_session(session)
 
         async with TestClient(TestServer(app)) as client:
@@ -773,7 +1003,7 @@ class TestResume:
             assert resp.status == 200
             data = await resp.json()
             assert data["checkpoint_id"] == "cp_node_complete_node_a_001"
-            _, kwargs = session.graph_runtime.trigger.await_args
+            _, kwargs = session.colony_runtime.trigger.await_args
             assert kwargs["session_state"]["run_id"] == "__legacy_run__"
 
     @pytest.mark.asyncio
@@ -804,7 +1034,7 @@ class TestStop:
     async def test_stop_found(self):
         session = _make_session()
         # Put a mock task in the stream so cancel_execution returns True
-        session.graph_runtime._mock_streams["default"]._execution_tasks["exec_abc"] = MagicMock()
+        session.colony_runtime._mock_streams["default"]._execution_tasks["exec_abc"] = MagicMock()
         app = _make_app_with_session(session)
         async with TestClient(TestServer(app)) as client:
             resp = await client.post(
@@ -814,6 +1044,22 @@ class TestStop:
             assert resp.status == 200
             data = await resp.json()
             assert data["stopped"] is True
+            assert data["cancelling"] is False
+
+    @pytest.mark.asyncio
+    async def test_stop_returns_accepted_while_execution_is_still_cancelling(self):
+        session = _make_session()
+        session.colony_runtime._mock_streams["default"].cancel_execution = AsyncMock(return_value="cancelling")
+        app = _make_app_with_session(session)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/sessions/test_agent/stop",
+                json={"execution_id": "exec_abc"},
+            )
+            assert resp.status == 202
+            data = await resp.json()
+            assert data["stopped"] is False
+            assert data["cancelling"] is True
 
     @pytest.mark.asyncio
     async def test_stop_not_found(self):
@@ -845,7 +1091,7 @@ class TestReplay:
         tmp_path, agent_name, base = tmp_agent_dir
 
         session = _make_session(tmp_dir=tmp_path / ".hive" / "agents" / agent_name)
-        session.graph_runtime.trigger = AsyncMock(return_value="exec_test_123")
+        session.colony_runtime.trigger = AsyncMock(return_value="exec_test_123")
         app = _make_app_with_session(session)
 
         async with TestClient(TestServer(app)) as client:
@@ -860,7 +1106,7 @@ class TestReplay:
             data = await resp.json()
             assert data["execution_id"] == "exec_test_123"
             assert data["replayed_from"] == session_id
-            _, kwargs = session.graph_runtime.trigger.await_args
+            _, kwargs = session.colony_runtime.trigger.await_args
             assert kwargs["session_state"]["run_id"] == "__legacy_run__"
 
     @pytest.mark.asyncio
@@ -943,9 +1189,7 @@ class TestGraphNodes:
             assert data["entry_node"] == "node_a"
 
     @pytest.mark.asyncio
-    async def test_list_nodes_with_session_enrichment(
-        self, nodes_and_edges, sample_session, tmp_agent_dir
-    ):
+    async def test_list_nodes_with_session_enrichment(self, nodes_and_edges, sample_session, tmp_agent_dir):
         session_id, session_dir, state = sample_session
         tmp_path, agent_name, base = tmp_agent_dir
         nodes, edges = nodes_and_edges
@@ -958,9 +1202,7 @@ class TestGraphNodes:
         app = _make_app_with_session(session)
 
         async with TestClient(TestServer(app)) as client:
-            resp = await client.get(
-                f"/api/sessions/test_agent/graphs/primary/nodes?session_id={session_id}"
-            )
+            resp = await client.get(f"/api/sessions/test_agent/graphs/primary/nodes?session_id={session_id}")
             assert resp.status == 200
             data = await resp.json()
             node_map = {n["id"]: n for n in data["nodes"]}
@@ -1009,9 +1251,7 @@ class TestGraphNodes:
             assert resp.status == 200
             data = await resp.json()
             assert "system_prompt" in data
-            assert (
-                data["system_prompt"] == "You are a helpful assistant that produces valid results."
-            )
+            assert data["system_prompt"] == "You are a helpful assistant that produces valid results."
 
             # Node without system_prompt should return empty string
             resp2 = await client.get("/api/sessions/test_agent/graphs/primary/nodes/node_b")
@@ -1046,16 +1286,14 @@ class TestNodeCriteria:
             assert data["output_keys"] == ["result"]
 
     @pytest.mark.asyncio
-    async def test_criteria_with_log_enrichment(
-        self, nodes_and_edges, sample_session, tmp_agent_dir
-    ):
+    async def test_criteria_with_log_enrichment(self, nodes_and_edges, sample_session, tmp_agent_dir):
         """Criteria endpoint enriched with last execution from logs."""
         session_id, session_dir, state = sample_session
         tmp_path, agent_name, base = tmp_agent_dir
         nodes, edges = nodes_and_edges
 
         # Create a real RuntimeLogStore pointed at the temp agent dir
-        from framework.runtime.runtime_log_store import RuntimeLogStore
+        from framework.tracker.runtime_log_store import RuntimeLogStore
 
         log_store = RuntimeLogStore(base)
 
@@ -1069,8 +1307,7 @@ class TestNodeCriteria:
 
         async with TestClient(TestServer(app)) as client:
             resp = await client.get(
-                f"/api/sessions/test_agent/graphs/primary/nodes/node_b/criteria"
-                f"?session_id={session_id}"
+                f"/api/sessions/test_agent/graphs/primary/nodes/node_b/criteria?session_id={session_id}"
             )
             assert resp.status == 200
             data = await resp.json()
@@ -1087,9 +1324,7 @@ class TestNodeCriteria:
         app = _make_app_with_session(session)
 
         async with TestClient(TestServer(app)) as client:
-            resp = await client.get(
-                "/api/sessions/test_agent/graphs/primary/nodes/nonexistent/criteria"
-            )
+            resp = await client.get("/api/sessions/test_agent/graphs/primary/nodes/nonexistent/criteria")
             assert resp.status == 404
 
 
@@ -1098,7 +1333,7 @@ class TestLogs:
     async def test_logs_no_log_store(self):
         """Agent without log store returns 404."""
         session = _make_session()
-        session.graph_runtime._runtime_log_store = None
+        session.colony_runtime._runtime_log_store = None
         app = _make_app_with_session(session)
 
         async with TestClient(TestServer(app)) as client:
@@ -1110,7 +1345,7 @@ class TestLogs:
         session_id, session_dir, state = sample_session
         tmp_path, agent_name, base = tmp_agent_dir
 
-        from framework.runtime.runtime_log_store import RuntimeLogStore
+        from framework.tracker.runtime_log_store import RuntimeLogStore
 
         log_store = RuntimeLogStore(base)
         session = _make_session(
@@ -1132,7 +1367,7 @@ class TestLogs:
         session_id, session_dir, state = custom_id_session
         tmp_path, agent_name, base = tmp_agent_dir
 
-        from framework.runtime.runtime_log_store import RuntimeLogStore
+        from framework.tracker.runtime_log_store import RuntimeLogStore
 
         log_store = RuntimeLogStore(base)
         session = _make_session(
@@ -1154,7 +1389,7 @@ class TestLogs:
         session_id, session_dir, state = sample_session
         tmp_path, agent_name, base = tmp_agent_dir
 
-        from framework.runtime.runtime_log_store import RuntimeLogStore
+        from framework.tracker.runtime_log_store import RuntimeLogStore
 
         log_store = RuntimeLogStore(base)
         session = _make_session(
@@ -1164,9 +1399,7 @@ class TestLogs:
         app = _make_app_with_session(session)
 
         async with TestClient(TestServer(app)) as client:
-            resp = await client.get(
-                f"/api/sessions/test_agent/logs?session_id={session_id}&level=summary"
-            )
+            resp = await client.get(f"/api/sessions/test_agent/logs?session_id={session_id}&level=summary")
             assert resp.status == 200
             data = await resp.json()
             assert data["run_id"] == session_id
@@ -1177,7 +1410,7 @@ class TestLogs:
         session_id, session_dir, state = sample_session
         tmp_path, agent_name, base = tmp_agent_dir
 
-        from framework.runtime.runtime_log_store import RuntimeLogStore
+        from framework.tracker.runtime_log_store import RuntimeLogStore
 
         log_store = RuntimeLogStore(base)
         session = _make_session(
@@ -1187,9 +1420,7 @@ class TestLogs:
         app = _make_app_with_session(session)
 
         async with TestClient(TestServer(app)) as client:
-            resp = await client.get(
-                f"/api/sessions/test_agent/logs?session_id={session_id}&level=details"
-            )
+            resp = await client.get(f"/api/sessions/test_agent/logs?session_id={session_id}&level=details")
             assert resp.status == 200
             data = await resp.json()
             assert data["session_id"] == session_id
@@ -1201,7 +1432,7 @@ class TestLogs:
         session_id, session_dir, state = sample_session
         tmp_path, agent_name, base = tmp_agent_dir
 
-        from framework.runtime.runtime_log_store import RuntimeLogStore
+        from framework.tracker.runtime_log_store import RuntimeLogStore
 
         log_store = RuntimeLogStore(base)
         session = _make_session(
@@ -1211,9 +1442,7 @@ class TestLogs:
         app = _make_app_with_session(session)
 
         async with TestClient(TestServer(app)) as client:
-            resp = await client.get(
-                f"/api/sessions/test_agent/logs?session_id={session_id}&level=tools"
-            )
+            resp = await client.get(f"/api/sessions/test_agent/logs?session_id={session_id}&level=tools")
             assert resp.status == 200
             data = await resp.json()
             assert data["session_id"] == session_id
@@ -1227,7 +1456,7 @@ class TestNodeLogs:
         tmp_path, agent_name, base = tmp_agent_dir
         nodes, edges = nodes_and_edges
 
-        from framework.runtime.runtime_log_store import RuntimeLogStore
+        from framework.tracker.runtime_log_store import RuntimeLogStore
 
         log_store = RuntimeLogStore(base)
         session = _make_session(
@@ -1256,7 +1485,7 @@ class TestNodeLogs:
     @pytest.mark.asyncio
     async def test_node_logs_missing_session_id(self, nodes_and_edges):
         nodes, edges = nodes_and_edges
-        from framework.runtime.runtime_log_store import RuntimeLogStore
+        from framework.tracker.runtime_log_store import RuntimeLogStore
 
         log_store = RuntimeLogStore(Path("/tmp/dummy"))
         session = _make_session(nodes=nodes, edges=edges, log_store=log_store)
@@ -1286,6 +1515,65 @@ class TestCredentials:
             assert resp.status == 200
             data = await resp.json()
             assert data["credentials"] == []
+
+    @pytest.mark.asyncio
+    async def test_list_credentials_skips_unreadable_encrypted_entry(self):
+        from pydantic import SecretStr
+
+        from framework.credentials.models import CredentialDecryptionError, CredentialKey, CredentialObject
+
+        class BrokenStore:
+            def list_credentials(self):
+                return ["good_cred", "bad_cred"]
+
+            def get_credential(self, credential_id, refresh_if_needed=False):
+                if credential_id == "bad_cred":
+                    raise CredentialDecryptionError("bad encrypted file")
+                return CredentialObject(
+                    id=credential_id,
+                    keys={"api_key": CredentialKey(name="api_key", value=SecretStr("secret"))},
+                )
+
+        app = create_app()
+        app["credential_store"] = BrokenStore()
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/credentials")
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert [c["credential_id"] for c in data["credentials"]] == ["good_cred"]
+        assert data["unreadable_credentials"] == ["bad_cred"]
+        assert "secret" not in json.dumps(data)
+
+    @pytest.mark.asyncio
+    async def test_get_credential_unreadable_returns_recoverable_conflict(self):
+        from framework.credentials.models import CredentialDecryptionError
+
+        class BrokenStore:
+            def get_credential(self, credential_id, refresh_if_needed=False):
+                raise CredentialDecryptionError("bad encrypted file")
+
+        app = create_app()
+        app["credential_store"] = BrokenStore()
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/credentials/bad_cred")
+            data = await resp.json()
+
+        assert resp.status == 409
+        assert data["credential_id"] == "bad_cred"
+        assert data["recoverable"] is True
+
+    def test_specs_availability_treats_decryption_error_as_unavailable(self):
+        from framework.credentials.models import CredentialDecryptionError
+        from framework.server.routes_credentials import _is_available_for_specs
+
+        class BrokenStore:
+            def is_available(self, credential_id):
+                raise CredentialDecryptionError("bad encrypted file")
+
+        assert _is_available_for_specs(BrokenStore(), "exa_search") is False
 
     @pytest.mark.asyncio
     async def test_save_and_list_credential(self):
@@ -1368,6 +1656,37 @@ class TestCredentials:
 
             store = app["credential_store"]
             assert store.get_key("test_cred", "api_key") == "new-value"
+
+
+class TestConfigRoutes:
+    """Tests for LLM configuration endpoints."""
+
+    @pytest.mark.asyncio
+    async def test_get_models_uses_shared_model_catalogue(self):
+        app = create_app()
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/config/models")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["models"] == get_models_catalogue()
+
+    @pytest.mark.asyncio
+    async def test_get_llm_config_exposes_subscription_defaults_from_presets(self):
+        app = create_app()
+        app["credential_store"] = MagicMock()
+        app["credential_store"].get.return_value = None
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/config/llm")
+            data = await resp.json()
+
+        assert resp.status == 200
+        subscriptions = {subscription["id"]: subscription for subscription in data["subscriptions"]}
+        assert subscriptions["codex"]["default_model"] == "gpt-5.3-codex"
+        assert subscriptions["codex"]["api_base"] == "https://chatgpt.com/backend-api/codex"
+        assert subscriptions["kimi_code"]["default_model"] == "kimi-k2.5"
 
 
 class TestSSEFormat:

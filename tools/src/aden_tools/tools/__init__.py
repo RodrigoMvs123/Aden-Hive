@@ -105,6 +105,7 @@ from .plaid_tool import register_tools as register_plaid
 from .port_scanner import register_tools as register_port_scanner
 from .postgres_tool import register_tools as register_postgres
 from .powerbi_tool import register_tools as register_powerbi
+from .prometheus_tool import register_tools as register_prometheus
 from .pushover_tool import register_tools as register_pushover
 from .quickbooks_tool import register_tools as register_quickbooks
 from .razorpay_tool import register_tools as register_razorpay
@@ -133,6 +134,7 @@ from .twilio_tool import register_tools as register_twilio
 from .twitter_tool import register_tools as register_twitter
 from .vercel_tool import register_tools as register_vercel
 from .vision_tool import register_tools as register_vision
+from .wandb_tool import register_tools as register_wandb
 
 try:
     from .web_scrape_tool import register_tools as register_web_scrape
@@ -148,12 +150,19 @@ from .zendesk_tool import register_tools as register_zendesk
 from .zoho_crm_tool import register_tools as register_zoho_crm
 from .zoom_tool import register_tools as register_zoom
 
+# Tool names registered by `_register_verified()`. Populated on first call.
+# Consumed by the `__aden_verified_manifest` sentinel tool so downstream
+# registries (e.g. the queen's MCP loader) can gate free/credential-less tools
+# on whether they have been promoted to verified status.
+_VERIFIED_TOOL_NAMES: set[str] = set()
+
 
 def _register_verified(
     mcp: FastMCP,
     credentials: CredentialStoreAdapter | None = None,
 ) -> None:
     """Register verified (stable) tools."""
+    _verified_before = set(mcp._tool_manager._tools.keys())
     # --- No credentials ---
     register_example(mcp)
     if register_web_scrape:
@@ -231,6 +240,22 @@ def _register_verified(
     register_notion(mcp, credentials=credentials)
     register_account_info(mcp, credentials=credentials)
 
+    _VERIFIED_TOOL_NAMES.update(set(mcp._tool_manager._tools.keys()) - _verified_before)
+
+
+def _register_manifest(mcp: FastMCP) -> None:
+    """Expose the verified-tool manifest as a sentinel MCP tool.
+
+    Registered after both verified and unverified passes so the manifest tool
+    itself never appears in `_VERIFIED_TOOL_NAMES`. Downstream registries call
+    this to decide whether a credential-less tool is safe to admit.
+    """
+
+    @mcp.tool(name="__aden_verified_manifest")
+    def aden_verified_manifest() -> list[str]:
+        """Return tool names registered by `_register_verified()`."""
+        return sorted(_VERIFIED_TOOL_NAMES)
+
 
 def _register_unverified(
     mcp: FastMCP,
@@ -286,6 +311,7 @@ def _register_unverified(
     register_pipedrive(mcp, credentials=credentials)
     register_plaid(mcp, credentials=credentials)
     register_powerbi(mcp, credentials=credentials)
+    register_prometheus(mcp, credentials=credentials)
     register_pushover(mcp, credentials=credentials)
     register_quickbooks(mcp, credentials=credentials)
     register_reddit(mcp, credentials=credentials)
@@ -306,6 +332,7 @@ def _register_unverified(
     register_zendesk(mcp, credentials=credentials)
     register_zoho_crm(mcp, credentials=credentials)
     register_zoom(mcp, credentials=credentials)
+    register_wandb(mcp, credentials=credentials)
     register_freshdesk(mcp, credentials=credentials)
 
 
@@ -331,6 +358,8 @@ def register_all_tools(
 
     if include_unverified:
         _register_unverified(mcp, credentials=credentials)
+
+    _register_manifest(mcp)
 
     return list(mcp._tool_manager._tools.keys())
 

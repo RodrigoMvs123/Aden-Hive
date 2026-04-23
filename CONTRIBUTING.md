@@ -333,6 +333,22 @@ make test-live     # Run live API integration tests (requires credentials)
 - **WebSocket** for real-time updates
 - **Tailwind CSS** for styling
 
+### Frontend Dev Workflow
+
+> **Note:** `./quickstart.sh` handles the full setup including the web UI.
+> The commands below are for contributors iterating on the frontend code after
+> initial setup is complete.
+
+```bash
+# Start the backend server
+hive serve
+
+# In a separate terminal, run the frontend dev server with hot-reload
+cd core/frontend
+npm install   # only needed after dependency changes
+npm run dev
+```
+
 ### Useful Development Commands
 
 ```bash
@@ -943,7 +959,7 @@ uv run pytest -m "not live"
 **Unit Test**
 ```python
 import pytest
-from framework.graph.node import Node
+from framework.orchestrator import NodeSpec as Node
 
 def test_node_creation():
     node = Node(id="test", name="Test Node", node_type="event_loop")
@@ -961,8 +977,8 @@ async def test_node_execution():
 **Integration Test**
 ```python
 import pytest
-from framework.graph.executor import GraphExecutor
-from framework.graph.node import Node
+from framework.orchestrator.orchestrator import Orchestrator as GraphExecutor
+from framework.orchestrator import NodeSpec as Node
 
 @pytest.mark.asyncio
 async def test_graph_execution_with_multiple_nodes():

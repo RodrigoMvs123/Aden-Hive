@@ -26,9 +26,7 @@ from playwright_stealth import Stealth
 
 # Browser-like User-Agent for actual page requests
 BROWSER_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
 
@@ -222,9 +220,7 @@ def register_tools(mcp: FastMCP) -> None:
             soup = BeautifulSoup(html_content, "html.parser")
 
             # Remove noise elements
-            for tag in soup(
-                ["script", "style", "nav", "footer", "header", "aside", "noscript", "iframe"]
-            ):
+            for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript", "iframe"]):
                 tag.decompose()
 
             # Get title and description
@@ -255,9 +251,10 @@ def register_tools(mcp: FastMCP) -> None:
             # Clean up whitespace
             text = " ".join(text.split())
 
-            # Truncate if needed
+            # Truncate if needed (reserve 3 chars for the ellipsis so the
+            # final string stays within max_length)
             if len(text) > max_length:
-                text = text[:max_length] + "..."
+                text = text[: max_length - 3] + "..."
 
             result: dict[str, Any] = {
                 "url": url,
