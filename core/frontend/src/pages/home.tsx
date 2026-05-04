@@ -61,6 +61,8 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [voiceError, setVoiceError] = useState<string | null>(null);
+  const voiceErrorTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceResultTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Fetch agents on mount so data is ready when user toggles
   useEffect(() => {
@@ -77,6 +79,14 @@ export default function Home() {
       .finally(() => {
         setLoading(false);
       });
+  }, []);
+
+  // Clean up voice timeouts on unmount
+  useEffect(() => {
+    return () => {
+      if (voiceErrorTimeoutRef.current) clearTimeout(voiceErrorTimeoutRef.current);
+      if (voiceResultTimeoutRef.current) clearTimeout(voiceResultTimeoutRef.current);
+    };
   }, []);
 
   const handleSelect = (agentPath: string) => {
@@ -98,7 +108,10 @@ export default function Home() {
   const handleVoiceResult = useCallback((transcript: string, isFinal: boolean) => {
     setInputValue(transcript);
     if (isFinal && transcript.trim()) {
-      setTimeout(() => {
+      // Clear any pending navigation timeout
+      if (voiceResultTimeoutRef.current) clearTimeout(voiceResultTimeoutRef.current);
+      // Brief delay to let UI reflect final transcript before navigating
+      voiceResultTimeoutRef.current = setTimeout(() => {
         navigate(`/workspace?agent=new-agent&prompt=${encodeURIComponent(transcript.trim())}`);
       }, 100);
     }
@@ -106,8 +119,10 @@ export default function Home() {
 
   const handleVoiceError = useCallback((err: string) => {
     setVoiceError(err);
+    // Clear any pending error timeout
+    if (voiceErrorTimeoutRef.current) clearTimeout(voiceErrorTimeoutRef.current);
     // Auto-clear after 4 seconds
-    setTimeout(() => setVoiceError(null), 4000);
+    voiceErrorTimeoutRef.current = setTimeout(() => setVoiceError(null), 4000);
   }, []);
 
   const { isListening, isSupported, startListening, stopListening } = useVoiceInput({
@@ -139,6 +154,18 @@ export default function Home() {
               I'm your Queen Bee — I create and coordinate worker agents to handle tasks for you.
             </p>
           </div>
+
+          {/* Voice error message */}
+          {voiceError && (
+            <div
+              role="alert"
+              aria-live="assertive"
+              aria-atomic="true"
+              className="text-xs text-destructive text-center mb-4 px-2 py-2 bg-destructive/10 rounded-lg"
+            >
+              {voiceError}
+            </div>
+          )}
 
           {/* Chat input */}
           <form onSubmit={handleSubmit} className="mb-6">
@@ -189,13 +216,6 @@ export default function Home() {
               </div>
             </div>
           </form>
-
-          {/* Voice error message */}
-          {voiceError && (
-            <p className="text-xs text-destructive text-center -mt-4 mb-2 px-2">
-              {voiceError}
-            </p>
-          )}
 
           {/* Action buttons */}
           <div className="flex items-center justify-center gap-3 mb-6">

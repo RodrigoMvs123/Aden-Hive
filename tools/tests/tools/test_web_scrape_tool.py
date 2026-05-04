@@ -116,6 +116,24 @@ class TestWebScrapeTool:
     @pytest.mark.asyncio
     @patch(_STEALTH_PATH)
     @patch(_PW_PATH)
+    async def test_truncation_respects_max_length(self, mock_pw, mock_stealth, web_scrape_fn):
+        """Truncated content (including the ellipsis) must not exceed max_length."""
+        # max_length is clamped to >=1000, so build content larger than that
+        long_text = "a" * 5000
+        html = f"<html><body>{long_text}</body></html>"
+        mock_cm, _, _ = _make_playwright_mocks(html, final_url="https://example.com")
+        mock_pw.return_value = mock_cm
+        mock_stealth.return_value.apply_stealth_async = AsyncMock()
+
+        result = await web_scrape_fn(url="https://example.com", max_length=1000)
+        assert "error" not in result
+        assert len(result["content"]) <= 1000
+        assert result["content"].endswith("...")
+        assert result["length"] == len(result["content"])
+
+    @pytest.mark.asyncio
+    @patch(_STEALTH_PATH)
+    @patch(_PW_PATH)
     async def test_include_links_option(self, mock_pw, mock_stealth, web_scrape_fn):
         """include_links parameter is accepted."""
         html = '<html><body><a href="/link">Link</a></body></html>'
@@ -356,6 +374,188 @@ class TestWebScrapeToolLinkConversion:
         assert len([t for t in texts if not t.strip()]) == 0
 
 
+class TestWebScrapeToolAIFriendlyOutput:
+    """Tests for the AI-friendly output additions: structured data,
+    headings, page_type, block-level newlines, inline links, truncation
+    metadata, and offset-based pagination."""
+
+    @pytest.mark.asyncio
+    @patch(_STEALTH_PATH)
+    @patch(_PW_PATH)
+    async def test_block_level_newlines_preserved(self, mock_pw, mock_stealth, web_scrape_fn):
+        """Block elements (p, h1, li) produce newlines, not space-collapsed."""
+        html = """
+        <html><body>
+            <h1>Title</h1>
+            <p>First paragraph.</p>
+            <p>Second paragraph.</p>
+            <ul><li>Item one</li><li>Item two</li></ul>
+        </body></html>
+        """
+        mock_cm, _, _ = _make_playwright_mocks(html, final_url="https://example.com")
+        mock_pw.return_value = mock_cm
+        mock_stealth.return_value.apply_stealth_async = AsyncMock()
+
+        result = await web_scrape_fn(url="https://example.com")
+        assert "error" not in result
+        content = result["content"]
+        assert "Title" in content
+        assert "First paragraph." in content
+        assert "Second paragraph." in content
+        # Block separation should produce newlines, not run paragraphs together
+        assert "First paragraph.\n" in content or "First paragraph.\n\nSecond" in content
+        assert "Item one" in content and "Item two" in content
+
+    @pytest.mark.asyncio
+    @patch(_STEALTH_PATH)
+    @patch(_PW_PATH)
+    async def test_headings_outline_returned(self, mock_pw, mock_stealth, web_scrape_fn):
+        """Headings outline lists h1-h6 with level + text."""
+        html = """
+        <html><body>
+            <h1>Top</h1>
+            <h2>Section A</h2>
+            <h3>Sub A1</h3>
+        </body></html>
+        """
+        mock_cm, _, _ = _make_playwright_mocks(html, final_url="https://example.com")
+        mock_pw.return_value = mock_cm
+        mock_stealth.return_value.apply_stealth_async = AsyncMock()
+
+        result = await web_scrape_fn(url="https://example.com")
+        assert result["headings"] == [
+            {"level": 1, "text": "Top"},
+            {"level": 2, "text": "Section A"},
+            {"level": 3, "text": "Sub A1"},
+        ]
+
+    @pytest.mark.asyncio
+    @patch(_STEALTH_PATH)
+    @patch(_PW_PATH)
+    async def test_inline_links_when_include_links(self, mock_pw, mock_stealth, web_scrape_fn):
+        """include_links=True inlines anchors as [text](url) in content."""
+        html = """
+        <html><body>
+            <p>See <a href="/docs">our docs</a> for details.</p>
+        </body></html>
+        """
+        mock_cm, _, _ = _make_playwright_mocks(html, final_url="https://example.com")
+        mock_pw.return_value = mock_cm
+        mock_stealth.return_value.apply_stealth_async = AsyncMock()
+
+        result = await web_scrape_fn(url="https://example.com", include_links=True)
+        assert "[our docs](https://example.com/docs)" in result["content"]
+        # Separate links list still present for back-compat
+        assert any(link["text"] == "our docs" for link in result["links"])
+
+    @pytest.mark.asyncio
+    @patch(_STEALTH_PATH)
+    @patch(_PW_PATH)
+    async def test_structured_data_json_ld(self, mock_pw, mock_stealth, web_scrape_fn):
+        """JSON-LD blocks are parsed and surfaced under structured_data."""
+        html = """
+        <html><head>
+            <script type="application/ld+json">
+            {"@type": "Article", "headline": "Hello"}
+            </script>
+        </head><body><p>body</p></body></html>
+        """
+        mock_cm, _, _ = _make_playwright_mocks(html, final_url="https://example.com")
+        mock_pw.return_value = mock_cm
+        mock_stealth.return_value.apply_stealth_async = AsyncMock()
+
+        result = await web_scrape_fn(url="https://example.com")
+        assert "structured_data" in result
+        assert result["structured_data"]["json_ld"] == [{"@type": "Article", "headline": "Hello"}]
+
+    @pytest.mark.asyncio
+    @patch(_STEALTH_PATH)
+    @patch(_PW_PATH)
+    async def test_structured_data_open_graph(self, mock_pw, mock_stealth, web_scrape_fn):
+        """OpenGraph meta tags are surfaced under structured_data.open_graph."""
+        html = """
+        <html><head>
+            <meta property="og:title" content="OG Title">
+            <meta property="og:type" content="article">
+        </head><body><p>body</p></body></html>
+        """
+        mock_cm, _, _ = _make_playwright_mocks(html, final_url="https://example.com")
+        mock_pw.return_value = mock_cm
+        mock_stealth.return_value.apply_stealth_async = AsyncMock()
+
+        result = await web_scrape_fn(url="https://example.com")
+        assert result["structured_data"]["open_graph"] == {
+            "title": "OG Title",
+            "type": "article",
+        }
+
+    @pytest.mark.asyncio
+    @patch(_STEALTH_PATH)
+    @patch(_PW_PATH)
+    async def test_truncation_metadata(self, mock_pw, mock_stealth, web_scrape_fn):
+        """Truncated responses set truncated/total_length/next_offset."""
+        html = f"<html><body>{'a' * 5000}</body></html>"
+        mock_cm, _, _ = _make_playwright_mocks(html, final_url="https://example.com")
+        mock_pw.return_value = mock_cm
+        mock_stealth.return_value.apply_stealth_async = AsyncMock()
+
+        result = await web_scrape_fn(url="https://example.com", max_length=1000)
+        assert result["truncated"] is True
+        assert result["total_length"] == 5000
+        assert result["next_offset"] == 1000
+        assert result["offset"] == 0
+
+    @pytest.mark.asyncio
+    @patch(_STEALTH_PATH)
+    @patch(_PW_PATH)
+    async def test_offset_pagination(self, mock_pw, mock_stealth, web_scrape_fn):
+        """offset arg returns content starting from the given character."""
+        body = "a" * 1000 + "b" * 1000 + "c" * 1000
+        html = f"<html><body>{body}</body></html>"
+        mock_cm, _, _ = _make_playwright_mocks(html, final_url="https://example.com")
+        mock_pw.return_value = mock_cm
+        mock_stealth.return_value.apply_stealth_async = AsyncMock()
+
+        result = await web_scrape_fn(url="https://example.com", max_length=1000, offset=1000)
+        assert result["offset"] == 1000
+        # Window should start in the b-region
+        assert result["content"].startswith("b")
+        assert result["truncated"] is True
+        assert result["next_offset"] == 2000
+
+    @pytest.mark.asyncio
+    @patch(_STEALTH_PATH)
+    @patch(_PW_PATH)
+    async def test_page_type_listing(self, mock_pw, mock_stealth, web_scrape_fn):
+        """3+ <article> elements => page_type 'listing'."""
+        html = """
+        <html><body>
+            <article><h2>Post 1</h2></article>
+            <article><h2>Post 2</h2></article>
+            <article><h2>Post 3</h2></article>
+        </body></html>
+        """
+        mock_cm, _, _ = _make_playwright_mocks(html, final_url="https://example.com")
+        mock_pw.return_value = mock_cm
+        mock_stealth.return_value.apply_stealth_async = AsyncMock()
+
+        result = await web_scrape_fn(url="https://example.com")
+        assert result["page_type"] == "listing"
+
+    @pytest.mark.asyncio
+    @patch(_STEALTH_PATH)
+    @patch(_PW_PATH)
+    async def test_page_type_article(self, mock_pw, mock_stealth, web_scrape_fn):
+        """Single <article> => page_type 'article'."""
+        html = "<html><body><article><p>Hello</p></article></body></html>"
+        mock_cm, _, _ = _make_playwright_mocks(html, final_url="https://example.com")
+        mock_pw.return_value = mock_cm
+        mock_stealth.return_value.apply_stealth_async = AsyncMock()
+
+        result = await web_scrape_fn(url="https://example.com")
+        assert result["page_type"] == "article"
+
+
 class TestWebScrapeToolErrorHandling:
     """Tests for error handling and early exit before JS wait."""
 
@@ -370,7 +570,9 @@ class TestWebScrapeToolErrorHandling:
         mock_stealth.return_value.apply_stealth_async = AsyncMock()
 
         result = await web_scrape_fn(url="https://example.com/missing")
-        assert result == {"error": "HTTP 404: Failed to fetch URL"}
+        assert result["error"] == "HTTP 404: Failed to fetch URL"
+        assert result["status"] == 404
+        assert "hint" in result
         mock_page.wait_for_load_state.assert_not_called()
 
     @pytest.mark.asyncio

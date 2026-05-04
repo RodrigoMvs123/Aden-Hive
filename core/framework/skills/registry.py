@@ -23,13 +23,24 @@ logger = logging.getLogger(__name__)
 
 # Default registry index URL (Phase 3 repo, may not exist yet)
 _DEFAULT_REGISTRY_URL = (
-    "https://raw.githubusercontent.com/hive-skill-registry/"
-    "hive-skill-registry/main/skill_index.json"
+    "https://raw.githubusercontent.com/hive-skill-registry/hive-skill-registry/main/skill_index.json"
 )
 
-_CACHE_DIR = Path.home() / ".hive" / "registry_cache"
-_CACHE_INDEX_PATH = _CACHE_DIR / "skill_index.json"
-_CACHE_METADATA_PATH = _CACHE_DIR / "metadata.json"
+
+def _cache_dir() -> Path:
+    from framework.config import HIVE_HOME
+
+    return HIVE_HOME / "registry_cache"
+
+
+def _cache_index_path() -> Path:
+    return _cache_dir() / "skill_index.json"
+
+
+def _cache_metadata_path() -> Path:
+    return _cache_dir() / "metadata.json"
+
+
 _CACHE_TTL_SECONDS = 3600  # 1 hour
 
 
@@ -47,7 +58,7 @@ class RegistryClient:
         cache_dir: Path | None = None,
     ) -> None:
         self._url = registry_url or os.environ.get("HIVE_REGISTRY_URL", _DEFAULT_REGISTRY_URL)
-        cache_root = cache_dir or _CACHE_DIR
+        cache_root = cache_dir or _cache_dir()
         self._index_path = cache_root / "skill_index.json"
         self._metadata_path = cache_root / "metadata.json"
 

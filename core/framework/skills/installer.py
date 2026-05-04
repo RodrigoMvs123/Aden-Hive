@@ -15,14 +15,18 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from framework.config import HIVE_HOME
 from framework.skills.parser import ParsedSkill
 from framework.skills.skill_errors import SkillError, SkillErrorCode
 
-# Default install destination for user-scope skills
-USER_SKILLS_DIR = Path.home() / ".hive" / "skills"
+# Default install destination for user-scope skills.
+# Anchored on HIVE_HOME so the desktop shell can override the install
+# root via $HIVE_HOME without patching every call site.
+USER_SKILLS_DIR = HIVE_HOME / "skills"
 
-# Sentinel file for the one-time security notice on first install (NFR-5)
-INSTALL_NOTICE_SENTINEL = Path.home() / ".hive" / ".install_notice_shown"
+# Sentinel file for the one-time security notice on first install (NFR-5).
+INSTALL_NOTICE_SENTINEL = HIVE_HOME / ".install_notice_shown"
+
 
 _INSTALL_NOTICE = """\
 ─────────────────────────────────────────────────────────────
@@ -44,7 +48,7 @@ _INSTALL_NOTICE = """\
 def maybe_show_install_notice() -> None:
     """Print a one-time security notice before the first skill install (NFR-5).
 
-    Touches a sentinel file in ~/.hive/ after showing the notice so it is
+    Touches a sentinel file in $HIVE_HOME after showing the notice so it is
     only displayed once across all future installs.
     """
     if INSTALL_NOTICE_SENTINEL.exists():
