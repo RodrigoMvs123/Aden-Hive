@@ -65,7 +65,7 @@ This is the recommended way to create your first agent.
 # Setup already done via quickstart.sh above
 
 # Start Claude Code and build an agent
-Use the coder-tools initialize_and_build_agent tool
+Use the files-tools initialize_and_build_agent tool
 ```
 
 Follow the interactive prompts to:
@@ -133,7 +133,7 @@ hive/
 │           └── file_system_toolkits/
 │
 ├── exports/                # Agent Packages (user-generated, not in repo)
-│   └── your_agent/         # Your agents created via coder-tools workflow
+│   └── your_agent/         # Your agents created via files-tools workflow
 │
 ├── examples/
 │   └── templates/          # Pre-built template agents
@@ -191,7 +191,7 @@ PYTHONPATH=exports uv run python -m my_agent test --type success
 1. **Dashboard**: Run `hive open` to launch the web dashboard
 2. **Detailed Setup**: See [environment-setup.md](./environment-setup.md)
 3. **Developer Guide**: See [developer-guide.md](./developer-guide.md)
-4. **Build Agents**: Use the coder-tools `initialize_and_build_agent` tool in Claude Code
+4. **Build Agents**: Use the files-tools `initialize_and_build_agent` tool in Claude Code
 5. **Custom Tools**: Learn to integrate MCP servers
 6. **Join Community**: [Discord](https://discord.com/invite/MXE49hrKDk)
 
@@ -236,4 +236,4 @@ pip uninstall -y framework tools
 - **Documentation**: Check the `/docs` folder
 - **Issues**: [github.com/adenhq/hive/issues](https://github.com/aden-hive/hive/issues)
 - **Discord**: [discord.com/invite/MXE49hrKDk](https://discord.com/invite/MXE49hrKDk)
-- **Build Agents**: Use the coder-tools workflow to create agents
+- **Build Agents**: Use the files-tools workflow to create agents

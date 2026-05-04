@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import AliasChoices, BaseModel, Field, computed_field
 
 if TYPE_CHECKING:
-    from framework.graph.executor import ExecutionResult
+    from framework.orchestrator.orchestrator import ExecutionResult
     from framework.schemas.run import Run
 
 
@@ -155,6 +155,17 @@ class SessionState(BaseModel):
     # True after first successful worker execution (gates trigger delivery on restart)
     worker_configured: bool = Field(default=False)
 
+    # Task-system fields (see framework/tasks).
+    # task_list_id: this session's own task list id (populated on first
+    #   task_create; immutable thereafter). Used for resume reattachment —
+    #   if it differs from resolve_task_list_id(ctx) on resume, a
+    #   TASK_LIST_REATTACH_MISMATCH event is emitted and a fresh list is
+    #   created at the resolved id (the orphan stays on disk).
+    task_list_id: str | None = None
+    # picked_up_from: for worker sessions, the (colony_task_list_id,
+    #   template_task_id) pair this session was spawned for.
+    picked_up_from: list[Any] | None = None
+
     model_config = {"extra": "allow"}
 
     @property
@@ -237,9 +248,7 @@ class SessionState(BaseModel):
             progress=SessionProgress(
                 current_node=result.paused_at or (result.path[-1] if result.path else None),
                 paused_at=result.paused_at,
-                resume_from=result.session_state.get("resume_from")
-                if result.session_state
-                else None,
+                resume_from=result.session_state.get("resume_from") if result.session_state else None,
                 steps_executed=result.steps_executed,
                 total_tokens=result.total_tokens,
                 total_latency_ms=result.total_latency_ms,
@@ -256,9 +265,7 @@ class SessionState(BaseModel):
                 error=result.error,
                 output=result.output,
             ),
-            data_buffer=result.session_state.get(
-                "data_buffer", result.session_state.get("memory", {})
-            )
+            data_buffer=result.session_state.get("data_buffer", result.session_state.get("memory", {}))
             if result.session_state
             else {},
             input_data=input_data or {},

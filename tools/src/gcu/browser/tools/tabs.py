@@ -1,5 +1,5 @@
 """
-Browser tab management tools - tabs, open, close, focus.
+Browser tab management tools - tabs, open, close, activate.
 
 All operations go through the Beeline extension - no Playwright required.
 """
@@ -8,14 +8,15 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import Annotated, Any
 
 from fastmcp import FastMCP
+from pydantic import Field
 
 from ..bridge import get_bridge
 from ..session import _active_profile
 from ..telemetry import log_tool_call
-from .lifecycle import _contexts
+from .lifecycle import _contexts, _ensure_context
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,7 @@ def register_tab_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_tabs", params, result=result)
             return result
 
@@ -87,9 +88,7 @@ def register_tab_tools(mcp: FastMCP) -> None:
             return result
         except Exception as e:
             result = {"ok": False, "error": str(e)}
-            log_tool_call(
-                "browser_tabs", params, error=e, duration_ms=(time.perf_counter() - start) * 1000
-            )
+            log_tool_call("browser_tabs", params, error=e, duration_ms=(time.perf_counter() - start) * 1000)
             return result
 
     @mcp.tool()
@@ -99,10 +98,14 @@ def register_tab_tools(mcp: FastMCP) -> None:
         profile: str | None = None,
     ) -> dict:
         """
-        Open a new browser tab and navigate to the given URL.
+        Open a browser tab at the given URL — preferred entry point.
 
-        The tab is automatically added to the agent's tab group.
-        This tool waits for the page to load before returning.
+        This is the agent's primary "go to a page" tool and the cold-start
+        entry point — if no browser context exists yet for the profile,
+        one is created transparently. The first call after a fresh
+        context reuses the seed ``about:blank`` tab; subsequent calls
+        open new tabs in the agent's tab group. Waits for the page to
+        load before returning.
 
         Args:
             url: URL to navigate to
@@ -121,16 +124,20 @@ def register_tab_tools(mcp: FastMCP) -> None:
             log_tool_call("browser_open", params, result=result)
             return result
 
-        ctx = _get_context(profile)
-        if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
-            log_tool_call("browser_open", params, result=result)
-            return result
-
         try:
-            # Create tab in the group
-            result = await bridge.create_tab(url=url, group_id=ctx.get("groupId"))
-            tab_id = result.get("tabId")
+            _, ctx, _ = await _ensure_context(bridge, profile)
+            # Reuse the seed about:blank tab from context.create on first open
+            seed_tab = ctx.pop("_seedTabId", None)
+            if seed_tab is not None:
+                tab_id = seed_tab
+            else:
+                result = await bridge.create_tab(url=url, group_id=ctx.get("groupId"))
+                tab_id = result.get("tabId")
+
+            # Track tab_ids so browser_stop can clear per-tab caches
+            # for every tab in this profile at once.
+            if tab_id is not None:
+                ctx.setdefault("tabs", set()).add(tab_id)
 
             # Update active tab if not background
             if not background and tab_id is not None:
@@ -156,9 +163,7 @@ def register_tab_tools(mcp: FastMCP) -> None:
             return result
         except Exception as e:
             result = {"ok": False, "error": str(e)}
-            log_tool_call(
-                "browser_open", params, error=e, duration_ms=(time.perf_counter() - start) * 1000
-            )
+            log_tool_call("browser_open", params, error=e, duration_ms=(time.perf_counter() - start) * 1000)
             return result
 
     @mcp.tool()
@@ -187,7 +192,7 @@ def register_tab_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_close", params, result=result)
             return result
 
@@ -200,6 +205,12 @@ def register_tab_tools(mcp: FastMCP) -> None:
 
         try:
             await bridge.close_tab(target_tab)
+
+            # Forget the closed tab so ctx["tabs"] only reflects tabs
+            # that could still get per-tab cache activity.
+            tabs_set = ctx.get("tabs")
+            if isinstance(tabs_set, set):
+                tabs_set.discard(target_tab)
 
             # Update active tab if we closed it
             if ctx.get("activeTabId") == target_tab:
@@ -217,22 +228,37 @@ def register_tab_tools(mcp: FastMCP) -> None:
             return result
         except Exception as e:
             result = {"ok": False, "error": str(e)}
-            log_tool_call(
-                "browser_close", params, error=e, duration_ms=(time.perf_counter() - start) * 1000
-            )
+            log_tool_call("browser_close", params, error=e, duration_ms=(time.perf_counter() - start) * 1000)
             return result
 
     @mcp.tool()
-    async def browser_focus(tab_id: int, profile: str | None = None) -> dict:
+    async def browser_activate_tab(
+        tab_id: Annotated[
+            int,
+            Field(
+                description=(
+                    "REQUIRED. Integer Chrome tab ID of the tab to switch to. "
+                    "Must be a concrete integer (not null). "
+                    "Call browser_tabs first to list available tabs and their IDs."
+                ),
+            ),
+        ],
+        profile: str | None = None,
+    ) -> dict:
         """
-        Focus a browser tab.
+        Switch the active browser tab to the given tab ID.
+
+        Use this to bring an existing tab to the foreground before interacting
+        with it. The ``tab_id`` argument is required and must be an integer
+        returned by ``browser_tabs``; passing null/None is not supported (use
+        ``browser_tabs`` to discover a valid ID first).
 
         Args:
-            tab_id: Chrome tab ID to focus
+            tab_id: Chrome tab ID to activate. Required integer.
             profile: Browser profile name (default: "default")
 
         Returns:
-            Dict with focus status
+            Dict with activation status
         """
         start = time.perf_counter()
         params = {"tab_id": tab_id, "profile": profile}
@@ -240,13 +266,13 @@ def register_tab_tools(mcp: FastMCP) -> None:
         bridge = get_bridge()
         if not bridge or not bridge.is_connected:
             result = {"ok": False, "error": "Browser extension not connected"}
-            log_tool_call("browser_focus", params, result=result)
+            log_tool_call("browser_activate_tab", params, result=result)
             return result
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
-            log_tool_call("browser_focus", params, result=result)
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
+            log_tool_call("browser_activate_tab", params, result=result)
             return result
 
         try:
@@ -254,7 +280,7 @@ def register_tab_tools(mcp: FastMCP) -> None:
             ctx["activeTabId"] = tab_id
             result = {"ok": True, "tabId": tab_id}
             log_tool_call(
-                "browser_focus",
+                "browser_activate_tab",
                 params,
                 result=result,
                 duration_ms=(time.perf_counter() - start) * 1000,
@@ -263,102 +289,9 @@ def register_tab_tools(mcp: FastMCP) -> None:
         except Exception as e:
             result = {"ok": False, "error": str(e)}
             log_tool_call(
-                "browser_focus", params, error=e, duration_ms=(time.perf_counter() - start) * 1000
-            )
-            return result
-
-    @mcp.tool()
-    async def browser_close_all(
-        keep_active: bool = True,
-        profile: str | None = None,
-    ) -> dict:
-        """
-        Close all browser tabs in the agent's group, optionally keeping active.
-
-        Args:
-            keep_active: If True (default), keep the active tab open.
-                If False, close ALL tabs (group remains but empty).
-            profile: Browser profile name (default: "default")
-
-        Returns:
-            Dict with number of closed tabs and remaining count
-        """
-        start = time.perf_counter()
-        params = {"keep_active": keep_active, "profile": profile}
-
-        bridge = get_bridge()
-        if not bridge or not bridge.is_connected:
-            result = {"ok": False, "error": "Browser extension not connected"}
-            log_tool_call("browser_close_all", params, result=result)
-            return result
-
-        ctx = _get_context(profile)
-        if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
-            log_tool_call("browser_close_all", params, result=result)
-            return result
-
-        try:
-            result = await bridge.list_tabs(ctx.get("groupId"))
-            tabs = result.get("tabs", [])
-            active_tab_id = ctx.get("activeTabId")
-
-            closed = 0
-            for tab in tabs:
-                tid = tab.get("id")
-                if keep_active and tid == active_tab_id:
-                    continue
-                try:
-                    await bridge.close_tab(tid)
-                    closed += 1
-                except Exception:
-                    pass
-
-            # Update active tab
-            if not keep_active:
-                ctx["activeTabId"] = None
-            else:
-                result = await bridge.list_tabs(ctx.get("groupId"))
-                remaining = result.get("tabs", [])
-                ctx["activeTabId"] = remaining[0].get("id") if remaining else None
-
-            result = {
-                "ok": True,
-                "closed_count": closed,
-                "remaining": len(tabs) - closed,
-            }
-            log_tool_call(
-                "browser_close_all",
-                params,
-                result=result,
-                duration_ms=(time.perf_counter() - start) * 1000,
-            )
-            return result
-        except Exception as e:
-            result = {"ok": False, "error": str(e)}
-            log_tool_call(
-                "browser_close_all",
+                "browser_activate_tab",
                 params,
                 error=e,
                 duration_ms=(time.perf_counter() - start) * 1000,
             )
             return result
-
-    @mcp.tool()
-    async def browser_close_finished(
-        keep_active: bool = True,
-        profile: str | None = None,
-    ) -> dict:
-        """
-        Close all tabs except the active one.
-
-        This is a convenience wrapper around browser_close_all.
-
-        Args:
-            keep_active: If True (default), keep the active tab open.
-            profile: Browser profile name (default: "default")
-
-        Returns:
-            Dict with closed_count, skipped_count, and remaining tab count
-        """
-        return await browser_close_all(keep_active=keep_active, profile=profile)

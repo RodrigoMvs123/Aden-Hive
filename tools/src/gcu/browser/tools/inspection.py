@@ -6,6 +6,7 @@ All operations go through the Beeline extension via CDP - no Playwright required
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -22,13 +23,40 @@ from .tabs import _get_context
 
 logger = logging.getLogger(__name__)
 
-# Target width for normalized screenshots (px in the delivered image)
-_SCREENSHOT_WIDTH = 600
 
-# Maps tab_id -> physical scale: image_coord × scale = physical pixels (for CDP Input events)
+# Fixed output width for all screenshots (bandwidth default). This
+# number does NOT affect coordinate semantics — click / hover / press
+# and rect tools all work in fractions of the viewport (0..1), which
+# are invariant to whatever resize / tile the vision API applies. The
+# 800 px width is simply small enough to keep JPEG payloads under
+# ~150 KB on typical UI screenshots.
+_SCREENSHOT_WIDTH = 800
+
+# Per-tab viewport-size cache populated on every browser_screenshot
+# and on lazy-init inside the click tools. Stores CSS-pixel viewport
+# dimensions (window.innerWidth / window.innerHeight). Click tools
+# multiply fractional inputs by these to get CSS coords before
+# dispatching CDP events; rect tools divide CSS-pixel DOM rects by
+# these to produce fractions for the agent.
+_viewport_sizes: dict[int, tuple[int, int]] = {}
+
+# Optional debug cache — physical-px scale per tab (orig_png_w /
+# _SCREENSHOT_WIDTH). Logged only; no consumer.
 _screenshot_scales: dict[int, float] = {}
-# Maps tab_id -> CSS scale: image_coord × scale = CSS pixels (for DOM APIs / getBoundingClientRect)
-_screenshot_css_scales: dict[int, float] = {}
+
+
+def clear_tab_state(tab_ids) -> None:
+    """Drop cached screenshot scales and viewport sizes for the given tab_ids.
+
+    Called when a tab closes or a profile's context is destroyed so stale
+    cache values can't bleed into a later tab that Chrome happens to assign
+    the same id. Accepts a single id or any iterable.
+    """
+    if isinstance(tab_ids, int):
+        tab_ids = (tab_ids,)
+    for tid in tab_ids:
+        _screenshot_scales.pop(tid, None)
+        _viewport_sizes.pop(tid, None)
 
 
 def _resize_and_annotate(
@@ -36,51 +64,88 @@ def _resize_and_annotate(
     css_width: int,
     dpr: float = 1.0,
     highlights: list[dict] | None = None,
-    width: int = _SCREENSHOT_WIDTH,
-) -> tuple[str, float, float]:
-    """Resize a base64 PNG to _SCREENSHOT_WIDTH wide, annotate highlights.
+) -> tuple[str, float]:
+    """Resize the captured PNG down to ``_SCREENSHOT_WIDTH`` (=800 px)
+    and re-encode as JPEG quality 75.
 
-    Returns (new_b64, physical_scale, css_scale) where:
-      physical_scale = physical_px_per_image_px  (multiply image coords → physical px)
-      css_scale      = css_px_per_image_px        (multiply image coords → CSS px for DOM APIs)
+    The image dimensions do NOT determine click coordinates any more —
+    the tools work in viewport fractions. This helper exists purely
+    for bandwidth + annotation overlay. Returns ``(new_b64,
+    physical_scale)`` where ``physical_scale = orig_png_w / output_w``
+    is kept for debug logging.
 
-    Highlights have x,y,w,h in CSS pixels (what getBoundingClientRect returns,
-    and what CDP Input.dispatchMouseEvent accepts).
-    Falls back to original data if Pillow unavailable or resize fails.
+    Highlight rects arrive in CSS px; they're converted to image-space
+    for overlay drawing via the local ``css_to_image = css_width /
+    output_w`` factor (computed inline — no external cache).
     """
+    if not css_width or css_width <= 0:
+        # Bridge always supplies css_width from window.innerWidth; only
+        # reach here on a degraded response. Return the raw PNG.
+        return data, 1.0
+
     try:
         from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        raw = base64.b64decode(data) if data else b""
+        orig_w = 0
+        if len(raw) >= 24 and raw[:8] == b"\x89PNG\r\n\x1a\n":
+            import struct
 
+            orig_w = struct.unpack(">I", raw[16:20])[0]
+        physical_scale = orig_w / _SCREENSHOT_WIDTH if orig_w else 1.0
+        logger.warning(
+            "PIL not available — screenshot resize SKIPPED. "
+            "Returning raw physical-px PNG. physicalScale=%.4f, "
+            "css_width=%d, dpr=%s. Install Pillow for annotation.",
+            physical_scale,
+            css_width,
+            dpr,
+        )
+        return data, round(physical_scale, 4)
+
+    try:
         raw = base64.b64decode(data)
         img = Image.open(io.BytesIO(raw)).convert("RGBA")
         orig_w, orig_h = img.size
-        new_w = width
-        new_h = round(orig_h * new_w / orig_w)
-        img = img.resize((new_w, new_h), Image.LANCZOS)
 
-        # Physical scale: how many native/physical pixels per image pixel
-        physical_scale = orig_w / width
-        # CSS scale: physical_scale / DPR
-        css_scale = (css_width / width) if css_width else (physical_scale / max(dpr, 1.0))
+        physical_scale = orig_w / _SCREENSHOT_WIDTH
+        new_w = _SCREENSHOT_WIDTH
+        new_h = round(orig_h * new_w / orig_w)
+        if (new_w, new_h) != img.size:
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+
+        # Local CSS → image px factor for overlay draws. Kept local —
+        # not exported, not stored, not leaked to the agent.
+        css_to_image = css_width / _SCREENSHOT_WIDTH
+
+        logger.info(
+            "Screenshot: orig=%dx%d → out=%dx%d (css_width=%d, dpr=%s), physicalScale=%.4f, css_to_image=%.4f",
+            orig_w,
+            orig_h,
+            new_w,
+            new_h,
+            css_width,
+            dpr,
+            physical_scale,
+            css_to_image,
+        )
 
         if highlights:
             overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
             draw = ImageDraw.Draw(overlay)
             try:
-                font = ImageFont.truetype(
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 11
-                )
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 11)
             except Exception:
                 font = ImageFont.load_default()
 
             for h in highlights:
                 kind = h.get("kind", "rect")
                 label = h.get("label", "")
-                # Highlights are in CSS px → convert to image px
-                ix = h["x"] / css_scale
-                iy = h["y"] / css_scale
-                iw = h.get("w", 0) / css_scale
-                ih = h.get("h", 0) / css_scale
+                # Highlights arrive in CSS px → convert to image px.
+                ix = h["x"] / css_to_image
+                iy = h["y"] / css_to_image
+                iw = h.get("w", 0) / css_to_image
+                ih = h.get("h", 0) / css_to_image
 
                 if kind == "point":
                     cx, cy, r = ix, iy, 10
@@ -90,12 +155,8 @@ def _resize_and_annotate(
                         outline=(239, 68, 68, 220),
                         width=2,
                     )
-                    draw.line(
-                        [(cx - r - 4, cy), (cx + r + 4, cy)], fill=(239, 68, 68, 220), width=2
-                    )
-                    draw.line(
-                        [(cx, cy - r - 4), (cx, cy + r + 4)], fill=(239, 68, 68, 220), width=2
-                    )
+                    draw.line([(cx - r - 4, cy), (cx + r + 4, cy)], fill=(239, 68, 68, 220), width=2)
+                    draw.line([(cx, cy - r - 4), (cx, cy + r + 4)], fill=(239, 68, 68, 220), width=2)
                 else:
                     draw.rectangle(
                         [(ix, iy), (ix + iw, iy + ih)],
@@ -104,11 +165,9 @@ def _resize_and_annotate(
                         width=2,
                     )
 
-                # Label: show image pixel position so user knows where to look
-                img_coords = f"img:({round(ix)},{round(iy)})"
-                display_label = f"{img_coords} {label}" if label else img_coords
+                display_label = f"({round(ix)},{round(iy)}) {label}".strip()
                 lx, ly = ix, max(2, iy - 16)
-                lx = max(2, min(lx, width - 120))
+                lx = max(2, min(lx, new_w - 120))
                 bbox = draw.textbbox((lx, ly), display_label, font=font)
                 pad = 3
                 draw.rectangle(
@@ -122,15 +181,85 @@ def _resize_and_annotate(
             img = img.convert("RGB")
 
         buf = io.BytesIO()
-        img.save(buf, format="PNG", optimize=True)
+        img.save(buf, format="JPEG", quality=75, optimize=True)
         return (
             base64.b64encode(buf.getvalue()).decode(),
             round(physical_scale, 4),
-            round(css_scale, 4),
         )
     except Exception:
-        logger.debug("Screenshot resize/annotate failed, using original", exc_info=True)
-        return data, 1.0, 1.0
+        logger.warning(
+            "Screenshot resize/annotate FAILED — returning original image. css_width=%s, dpr=%s.",
+            css_width,
+            dpr,
+            exc_info=True,
+        )
+        return data, 1.0
+
+
+async def _ensure_viewport_size(tab_id: int, _caller: str = "unknown") -> tuple[int, int]:
+    """Return ``(cssWidth, cssHeight)`` for ``tab_id``, always
+    refreshing from ``window.innerWidth`` / ``window.innerHeight``.
+
+    Used by click / hover / press tools to turn fractional inputs
+    (0..1) into CSS px, and by rect tools to turn CSS-px rects into
+    fractions.
+
+    Every call emits a ``viewport_sample`` telemetry entry so we
+    can build a timeline of Chrome's reported viewport across an
+    agent run — needed to diagnose the sessions where cssH changes
+    silently (no visible layout shift) between screenshot and
+    click. The entry records the live value, the cached value, and
+    the delta so the transition point is trivial to locate in
+    ``~/.hive/browser-logs/browser-YYYY-MM-DD.jsonl``.
+
+    Falls back to the cached value on evaluate failure, then to
+    ``(1, 1)`` if there's no cache — identity-op is a safe no-op.
+    """
+    bridge = get_bridge()
+    cw = ch = 0
+    evaluate_error: str | None = None
+    try:
+        result = await bridge.evaluate(tab_id, "({w: window.innerWidth, h: window.innerHeight})")
+        inner = (result or {}).get("result") or {}
+        cw = int(float(inner.get("w") or 0))
+        ch = int(float(inner.get("h") or 0))
+    except Exception as e:
+        evaluate_error = str(e)
+        cw = ch = 0
+
+    cached_before = _viewport_sizes.get(tab_id)
+
+    if cw <= 0 or ch <= 0:
+        if cached_before is not None and cached_before[0] > 0 and cached_before[1] > 0:
+            result_cw, result_ch = cached_before
+        else:
+            result_cw, result_ch = 1, 1
+    else:
+        result_cw, result_ch = cw, ch
+        _viewport_sizes[tab_id] = (cw, ch)
+
+    try:
+        from ..telemetry import write_log
+
+        write_log(
+            {
+                "type": "viewport_sample",
+                "tab_id": tab_id,
+                "caller": _caller,
+                "live_w": cw,
+                "live_h": ch,
+                "cached_w": cached_before[0] if cached_before else None,
+                "cached_h": cached_before[1] if cached_before else None,
+                "deltaH_vs_cache": ((ch - cached_before[1]) if (cached_before and ch > 0) else None),
+                "returned_w": result_cw,
+                "returned_h": result_ch,
+                "evaluate_error": evaluate_error,
+            }
+        )
+    except Exception:
+        pass
+
+    return result_cw, result_ch
 
 
 def register_inspection_tools(mcp: FastMCP) -> None:
@@ -142,29 +271,33 @@ def register_inspection_tools(mcp: FastMCP) -> None:
         profile: str | None = None,
         full_page: bool = False,
         selector: str | None = None,
-        image_type: Literal["png", "jpeg"] = "png",
         annotate: bool = True,
-        width: int = _SCREENSHOT_WIDTH,
     ) -> list:
         """
         Take a screenshot of the current page.
 
-        Returns a normalized image alongside text metadata (URL, size, scale
-        factors, etc.). Automatically annotates the last interaction (click,
-        hover, type) with a bounding box overlay.
+        Image is 800 px wide (JPEG quality 75, ~50–120 KB). All
+        coordinate tools work in **fractions of the viewport (0..1)**,
+        not pixels — so read a target's proportional position off this
+        image ("~35 % from the left, ~20 % from the top") and pass
+        ``(0.35, 0.20)`` to ``browser_click_coordinate`` /
+        ``browser_hover_coordinate`` / ``browser_press_at``.
+        ``browser_get_rect`` and ``browser_shadow_query`` likewise
+        return coordinates as fractions.
 
         Args:
             tab_id: Chrome tab ID (default: active tab)
             profile: Browser profile name (default: "default")
-            full_page: Capture full scrollable page (default: False)
+            full_page: Capture full scrollable page (default: False).
+                Note: full_page images extend beyond the viewport, so
+                fractions read off them do NOT map cleanly to
+                viewport-space clicks. Use for reading / overview only,
+                not for pointing.
             selector: CSS selector to screenshot a specific element (optional)
-            image_type: Image format - png or jpeg (default: png)
             annotate: Draw bounding box of last interaction on image (default: True)
-            width: Output image width in pixels (default: 600). Use 800+ for fine
-                   text, 400 for quick layout checks.
 
         Returns:
-            List of content blocks: text metadata + image
+            List of content blocks: text metadata + image.
         """
         start = time.perf_counter()
         params = {
@@ -192,25 +325,17 @@ def register_inspection_tools(mcp: FastMCP) -> None:
         ctx = _get_context(profile)
         if not ctx:
             err_msg = json.dumps({"ok": False, "error": "Browser not started"})
-            log_tool_call(
-                "browser_screenshot", params, result={"ok": False, "error": "Browser not started"}
-            )
+            log_tool_call("browser_screenshot", params, result={"ok": False, "error": "Browser not started"})
             return [TextContent(type="text", text=err_msg)]
 
         target_tab = tab_id or ctx.get("activeTabId")
         if target_tab is None:
-            result = [
-                TextContent(type="text", text=json.dumps({"ok": False, "error": "No active tab"}))
-            ]
-            log_tool_call(
-                "browser_screenshot", params, result={"ok": False, "error": "No active tab"}
-            )
+            result = [TextContent(type="text", text=json.dumps({"ok": False, "error": "No active tab"}))]
+            log_tool_call("browser_screenshot", params, result={"ok": False, "error": "No active tab"})
             return result
 
         try:
-            screenshot_result = await bridge.screenshot(
-                target_tab, full_page=full_page, selector=selector
-            )
+            screenshot_result = await bridge.screenshot(target_tab, full_page=full_page, selector=selector)
 
             if not screenshot_result.get("ok"):
                 log_tool_call(
@@ -222,9 +347,48 @@ def register_inspection_tools(mcp: FastMCP) -> None:
                 return [TextContent(type="text", text=json.dumps(screenshot_result))]
 
             data = screenshot_result.get("data")
-            mime_type = screenshot_result.get("mimeType", "image/png")
             css_width = screenshot_result.get("cssWidth", 0)
+            css_height_raw = screenshot_result.get("cssHeight", 0)
             dpr = screenshot_result.get("devicePixelRatio", 1.0)
+            png_w = screenshot_result.get("pngWidth", 0)
+            png_h = screenshot_result.get("pngHeight", 0)
+
+            # Diagnostic for the y-axis offset hunt: clicks convert
+            # fractions through cssHeight, but the displayed image is
+            # resized using the PNG's aspect ratio. If png_h differs
+            # from cssHeight × dpr the two coordinate systems drift.
+            # X is checked too — should always read delta_x ≈ 0 since
+            # physical_scale is derived from pngWidth.
+            try:
+                from ..telemetry import write_log
+
+                expected_w = css_width * dpr
+                expected_h = css_height_raw * dpr
+                write_log(
+                    {
+                        "type": "screenshot_geometry",
+                        "tab_id": target_tab,
+                        "url": screenshot_result.get("url", ""),
+                        "pngWidth": png_w,
+                        "pngHeight": png_h,
+                        "cssWidth": css_width,
+                        "cssHeight": css_height_raw,
+                        "dpr": dpr,
+                        "expectedPngWidth": expected_w,
+                        "expectedPngHeight": expected_h,
+                        "deltaPngWidthPx": png_w - expected_w,
+                        "deltaPngHeightPx": png_h - expected_h,
+                        # If the PNG is taller than cssHeight×dpr (e.g. a
+                        # devtools-attached banner adds rows above the page
+                        # in the capture), clicks land BELOW intended at
+                        # the top of the page and converge to 0 error at
+                        # the bottom. Reverse signs if PNG is shorter.
+                        # Worst-case error in CSS px at fy=0:
+                        "yErrorAtTopCssPx": ((png_h - expected_h) / dpr if dpr else 0),
+                    }
+                )
+            except Exception:
+                pass
 
             # Collect highlights: last interaction from bridge + CDP already drew in browser
             from ..bridge import _interaction_highlights
@@ -233,32 +397,50 @@ def register_inspection_tools(mcp: FastMCP) -> None:
             if annotate and target_tab in _interaction_highlights:
                 highlights = [_interaction_highlights[target_tab]]
 
-            # Normalize to 800px wide and annotate
-            data, physical_scale, css_scale = _resize_and_annotate(
-                data, css_width, dpr=dpr, highlights=highlights, width=width
+            # Resize to CSS-viewport dimensions (image px == CSS px)
+            # and re-encode as JPEG. Offloaded to a thread because PIL
+            # Image.open/resize/ImageDraw/composite on a 2-megapixel
+            # PNG blocks for ~150–300 ms of CPU — plenty to freeze the
+            # asyncio event loop. Reentrant: no shared state.
+            data, physical_scale = await asyncio.to_thread(
+                _resize_and_annotate,
+                data,
+                css_width,
+                dpr,
+                highlights,
             )
-            _screenshot_scales[target_tab] = physical_scale
-            _screenshot_css_scales[target_tab] = css_scale
+            # Cache live viewport dimensions so click / hover / press /
+            # rect tools can translate fractions ↔ CSS px without
+            # asking the page again.
+            css_height = int(screenshot_result.get("cssHeight", 0)) or 0
+            if target_tab is not None and css_width > 0 and css_height > 0:
+                _viewport_sizes[target_tab] = (int(css_width), css_height)
+                _screenshot_scales[target_tab] = physical_scale
 
             meta = json.dumps(
                 {
                     "ok": True,
                     "tabId": target_tab,
                     "url": screenshot_result.get("url", ""),
-                    "imageType": mime_type.split("/")[-1],
+                    "imageType": "jpeg",
                     "size": len(base64.b64decode(data)) if data else 0,
-                    "imageWidth": width,
+                    "imageWidth": _SCREENSHOT_WIDTH,
+                    "cssWidth": css_width,
+                    "cssHeight": css_height,
                     "fullPage": full_page,
                     "devicePixelRatio": dpr,
                     "physicalScale": physical_scale,
-                    "cssScale": css_scale,
                     "annotated": bool(highlights),
                     "scaleHint": (
-                        f"image_coord × {physical_scale} = physical px "
-                        f"(for browser_click_coordinate/"
-                        f"hover_coordinate); "
-                        f"image_coord × {css_scale} = CSS px "
-                        f"(for getBoundingClientRect)"
+                        "Coordinates for click / hover / press are "
+                        "fractions 0..1 of the viewport. Read a "
+                        "target's proportional position off this image "
+                        "(e.g. '~35 % from the left, ~20 % from the top' "
+                        "→ (0.35, 0.20)) and pass that to "
+                        "browser_click_coordinate / "
+                        "browser_hover_coordinate / browser_press_at. "
+                        "browser_get_rect / browser_shadow_query / "
+                        "focused_element.rect return fractions too."
                     ),
                 }
             )
@@ -270,15 +452,17 @@ def register_inspection_tools(mcp: FastMCP) -> None:
                     "ok": True,
                     "size": len(base64.b64decode(data)) if data else 0,
                     "url": screenshot_result.get("url", ""),
+                    "cssWidth": css_width,
+                    "cssHeight": css_height,
                     "physicalScale": physical_scale,
-                    "cssScale": css_scale,
+                    "dpr": dpr,
                 },
                 duration_ms=(time.perf_counter() - start) * 1000,
             )
 
             return [
                 TextContent(type="text", text=meta),
-                ImageContent(type="image", data=data, mimeType=mime_type),
+                ImageContent(type="image", data=data, mimeType="image/jpeg"),
             ]
         except Exception as e:
             log_tool_call(
@@ -288,59 +472,6 @@ def register_inspection_tools(mcp: FastMCP) -> None:
                 duration_ms=(time.perf_counter() - start) * 1000,
             )
             return [TextContent(type="text", text=json.dumps({"ok": False, "error": str(e)}))]
-
-    @mcp.tool()
-    def browser_coords(
-        x: float,
-        y: float,
-        tab_id: int | None = None,
-        profile: str | None = None,
-    ) -> dict:
-        """
-        Convert screenshot image coordinates to browser coordinates.
-
-        After browser_screenshot returns an 800px-wide image, use this to translate
-        pixel positions you see in the image into the two coordinate spaces used by
-        browser tools:
-
-        - physical_x/y → use with browser_click_coordinate, browser_hover_coordinate,
-          browser_press_at (CDP Input events work in physical pixels)
-        - css_x/y → use with getBoundingClientRect comparisons and DOM APIs
-
-        Args:
-            x: X pixel position in the 800px screenshot image
-            y: Y pixel position in the 800px screenshot image
-            tab_id: Chrome tab ID (default: active tab for profile)
-            profile: Browser profile name (default: "default")
-
-        Returns:
-            Dict with physical_x, physical_y, css_x, css_y, and scale factors
-        """
-        ctx = _get_context(profile)
-        target_tab = tab_id or (ctx.get("activeTabId") if ctx else None)
-
-        physical_scale = _screenshot_scales.get(target_tab, 1.0) if target_tab else 1.0
-        # css_scale stored in second slot via _screenshot_css_scales
-        css_scale = (
-            _screenshot_css_scales.get(target_tab, physical_scale) if target_tab else physical_scale
-        )
-
-        return {
-            "ok": True,
-            "physical_x": round(x * physical_scale, 1),
-            "physical_y": round(y * physical_scale, 1),
-            "css_x": round(x * css_scale, 1),
-            "css_y": round(y * css_scale, 1),
-            "physicalScale": physical_scale,
-            "cssScale": css_scale,
-            "tabId": target_tab,
-            "note": (
-                "Use physical_x/y with browser_click_coordinate,"
-                " browser_hover_coordinate, browser_press_at."
-                " Use css_x/y with getBoundingClientRect"
-                " and DOM APIs."
-            ),
-        }
 
     @mcp.tool()
     async def browser_shadow_query(
@@ -353,7 +484,9 @@ def register_inspection_tools(mcp: FastMCP) -> None:
 
         Traverses shadow roots to find elements inside closed/open shadow DOM,
         overlays, and virtual-rendered components (e.g. LinkedIn's #interop-outlet).
-        Returns getBoundingClientRect in both CSS and physical pixels.
+        Returns the element's bounding rect as **fractions of the
+        viewport (0..1)** — feed ``rect.cx`` / ``rect.cy`` straight
+        into browser_click_coordinate / hover_coordinate / press_at.
 
         Args:
             selector: CSS selectors joined by ' >>> ' to pierce shadow roots.
@@ -362,7 +495,8 @@ def register_inspection_tools(mcp: FastMCP) -> None:
             profile: Browser profile name (default: "default")
 
         Returns:
-            Dict with rect (CSS px) and physical rect (CSS px × DPR) of the element
+            Dict with ``rect`` block (x, y, w, h, cx, cy) as fractions,
+            plus ``cssWidth`` / ``cssHeight`` for reference.
         """
         bridge = get_bridge()
         if not bridge or not bridge.is_connected:
@@ -379,36 +513,27 @@ def register_inspection_tools(mcp: FastMCP) -> None:
             return result
 
         rect = result["rect"]
-        physical_scale = _screenshot_scales.get(target_tab, 1.0)
-        css_scale = _screenshot_css_scales.get(target_tab, 1.0)
-        dpr = physical_scale / css_scale if css_scale else 1.0
-
+        cw, ch = await _ensure_viewport_size(target_tab, _caller="browser_shadow_query")
+        cw_f = float(cw) if cw > 0 else 1.0
+        ch_f = float(ch) if ch > 0 else 1.0
         return {
             "ok": True,
             "selector": selector,
             "tag": rect.get("tag"),
-            "css": {
-                "x": rect["x"],
-                "y": rect["y"],
-                "w": rect["w"],
-                "h": rect["h"],
-                "cx": rect["cx"],
-                "cy": rect["cy"],
+            "rect": {
+                "x": round(rect["x"] / cw_f, 4),
+                "y": round(rect["y"] / ch_f, 4),
+                "w": round(rect["w"] / cw_f, 4),
+                "h": round(rect["h"] / ch_f, 4),
+                "cx": round(rect["cx"] / cw_f, 4),
+                "cy": round(rect["cy"] / ch_f, 4),
             },
-            "physical": {
-                "x": round(rect["x"] * dpr, 1),
-                "y": round(rect["y"] * dpr, 1),
-                "w": round(rect["w"] * dpr, 1),
-                "h": round(rect["h"] * dpr, 1),
-                "cx": round(rect["cx"] * dpr, 1),
-                "cy": round(rect["cy"] * dpr, 1),
-            },
+            "cssWidth": cw,
+            "cssHeight": ch,
             "note": (
-                "Use physical.cx/cy with"
-                " browser_click_coordinate or"
-                " browser_hover_coordinate."
-                " Use css.cx/cy with"
-                " getBoundingClientRect comparisons."
+                "rect fields are fractions of the viewport (0..1). "
+                "Pass rect.cx / rect.cy to browser_click_coordinate / "
+                "hover_coordinate / press_at."
             ),
         }
 
@@ -421,9 +546,10 @@ def register_inspection_tools(mcp: FastMCP) -> None:
         """
         Get the bounding rect of an element by CSS selector.
 
-        Supports '>>>' shadow-piercing selectors for overlay/shadow DOM content.
-        Returns coordinates in both CSS pixels (for DOM APIs) and physical pixels
-        (for browser_click_coordinate, browser_hover_coordinate, browser_press_at).
+        Supports '>>>' shadow-piercing selectors for overlay/shadow DOM
+        content. Returns the rect as **fractions of the viewport
+        (0..1)** — the same coordinate space browser_click_coordinate
+        / hover_coordinate / press_at expect.
 
         Args:
             selector: CSS selector, optionally with ' >>> ' to pierce shadow roots.
@@ -432,7 +558,8 @@ def register_inspection_tools(mcp: FastMCP) -> None:
             profile: Browser profile name (default: "default")
 
         Returns:
-            Dict with css and physical bounding rects
+            Dict with ``rect`` block (x, y, w, h, cx, cy) as fractions,
+            plus ``cssWidth`` / ``cssHeight`` for reference.
         """
         bridge = get_bridge()
         if not bridge or not bridge.is_connected:
@@ -449,37 +576,35 @@ def register_inspection_tools(mcp: FastMCP) -> None:
             return result
 
         rect = result["rect"]
-        physical_scale = _screenshot_scales.get(target_tab, 1.0)
-        css_scale = _screenshot_css_scales.get(target_tab, 1.0)
-        dpr = physical_scale / css_scale if css_scale else 1.0
-
+        cw, ch = await _ensure_viewport_size(target_tab, _caller="browser_get_rect")
+        cw_f = float(cw) if cw > 0 else 1.0
+        ch_f = float(ch) if ch > 0 else 1.0
         return {
             "ok": True,
             "selector": selector,
             "tag": rect.get("tag"),
-            "css": {
-                "x": rect["x"],
-                "y": rect["y"],
-                "w": rect["w"],
-                "h": rect["h"],
-                "cx": rect["cx"],
-                "cy": rect["cy"],
+            "rect": {
+                "x": round(rect["x"] / cw_f, 4),
+                "y": round(rect["y"] / ch_f, 4),
+                "w": round(rect["w"] / cw_f, 4),
+                "h": round(rect["h"] / ch_f, 4),
+                "cx": round(rect["cx"] / cw_f, 4),
+                "cy": round(rect["cy"] / ch_f, 4),
             },
-            "physical": {
-                "x": round(rect["x"] * dpr, 1),
-                "y": round(rect["y"] * dpr, 1),
-                "w": round(rect["w"] * dpr, 1),
-                "h": round(rect["h"] * dpr, 1),
-                "cx": round(rect["cx"] * dpr, 1),
-                "cy": round(rect["cy"] * dpr, 1),
-            },
-            "note": "Use physical.cx/cy with browser_click_coordinate or browser_hover_coordinate.",
+            "cssWidth": cw,
+            "cssHeight": ch,
+            "note": (
+                "rect fields are fractions of the viewport (0..1). "
+                "Pass rect.cx / rect.cy to browser_click_coordinate / "
+                "hover_coordinate / press_at."
+            ),
         }
 
     @mcp.tool()
     async def browser_snapshot(
         tab_id: int | None = None,
         profile: str | None = None,
+        mode: Literal["default", "simple", "interactive"] = "default",
     ) -> dict:
         """
         Get an accessibility snapshot of the page.
@@ -498,12 +623,16 @@ def register_inspection_tools(mcp: FastMCP) -> None:
         Args:
             tab_id: Chrome tab ID (default: active tab)
             profile: Browser profile name (default: "default")
+            mode: Snapshot filtering mode (default: "default")
+                - "default": full accessibility tree
+                - "simple": interactive + content nodes, skip unnamed structural nodes
+                - "interactive": only interactive nodes (buttons, links, inputs, etc.)
 
         Returns:
             Dict with the snapshot text tree, URL, and tab ID
         """
         start = time.perf_counter()
-        params = {"tab_id": tab_id, "profile": profile}
+        params = {"tab_id": tab_id, "profile": profile, "mode": mode}
 
         bridge = get_bridge()
         if not bridge or not bridge.is_connected:
@@ -513,7 +642,7 @@ def register_inspection_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_snapshot", params, result=result)
             return result
 
@@ -524,7 +653,7 @@ def register_inspection_tools(mcp: FastMCP) -> None:
             return result
 
         try:
-            snapshot_result = await bridge.snapshot(target_tab)
+            snapshot_result = await bridge.snapshot(target_tab, mode=mode)
             log_tool_call(
                 "browser_snapshot",
                 params,
@@ -567,9 +696,7 @@ def register_inspection_tools(mcp: FastMCP) -> None:
             "message": "Console capture not yet implemented",
             "suggestion": "Use browser_evaluate to check specific values or errors",
         }
-        log_tool_call(
-            "browser_console", {"tab_id": tab_id, "profile": profile, "level": level}, result=result
-        )
+        log_tool_call("browser_console", {"tab_id": tab_id, "profile": profile, "level": level}, result=result)
         return result
 
     @mcp.tool()
@@ -600,7 +727,7 @@ def register_inspection_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_html", params, result=result)
             return result
 
@@ -651,7 +778,5 @@ def register_inspection_tools(mcp: FastMCP) -> None:
             return eval_result
         except Exception as e:
             result = {"ok": False, "error": str(e)}
-            log_tool_call(
-                "browser_html", params, error=e, duration_ms=(time.perf_counter() - start) * 1000
-            )
+            log_tool_call("browser_html", params, error=e, duration_ms=(time.perf_counter() - start) * 1000)
             return result

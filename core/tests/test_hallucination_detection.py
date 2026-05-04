@@ -7,8 +7,8 @@ string content, not just the first 500 characters.
 
 import pytest
 
-from framework.graph.node import DataBuffer, DataBufferWriteError
-from framework.graph.validator import OutputValidator, ValidationResult
+from framework.orchestrator.node import DataBuffer, DataBufferWriteError
+from framework.orchestrator.validator import OutputValidator, ValidationResult
 
 
 class TestDataBufferHallucinationDetection:
@@ -121,9 +121,7 @@ class TestDataBufferHallucinationDetection:
         # Create a 50KB string with code at the 75% mark
         size = 50000
         code_position = int(size * 0.75)
-        content = (
-            "A" * code_position + "def hidden_code(): pass" + "B" * (size - code_position - 25)
-        )
+        content = "A" * code_position + "def hidden_code(): pass" + "B" * (size - code_position - 25)
 
         with pytest.raises(DataBufferWriteError) as exc_info:
             buffer.write("output", content)

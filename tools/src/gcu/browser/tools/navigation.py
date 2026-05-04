@@ -14,6 +14,7 @@ from fastmcp import FastMCP
 
 from ..bridge import get_bridge
 from ..telemetry import log_tool_call
+from .lifecycle import _ensure_context
 from .tabs import _get_context
 
 logger = logging.getLogger(__name__)
@@ -32,8 +33,13 @@ def register_navigation_tools(mcp: FastMCP) -> None:
         """
         Navigate a tab to a URL.
 
-        This tool waits for the page to reach the ``wait_until`` condition
-        before returning.
+        Lazy-creates a browser context if none exists; when no ``tab_id``
+        is given and the context was just created, navigation lands on
+        the seed tab. Prefer ``browser_open`` when you specifically want
+        a new tab — ``browser_navigate`` is for redirecting an existing tab.
+
+        Waits for the page to reach the ``wait_until`` condition before
+        returning.
 
         Args:
             url: URL to navigate to
@@ -54,10 +60,16 @@ def register_navigation_tools(mcp: FastMCP) -> None:
             log_tool_call("browser_navigate", params, result=result)
             return result
 
-        ctx = _get_context(profile)
-        if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
-            log_tool_call("browser_navigate", params, result=result)
+        try:
+            _, ctx, _ = await _ensure_context(bridge, profile)
+        except Exception as e:
+            result = {"ok": False, "error": str(e)}
+            log_tool_call(
+                "browser_navigate",
+                params,
+                error=e,
+                duration_ms=(time.perf_counter() - start) * 1000,
+            )
             return result
 
         target_tab = tab_id or ctx.get("activeTabId")
@@ -117,7 +129,7 @@ def register_navigation_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_go_back", params, result=result)
             return result
 
@@ -138,9 +150,7 @@ def register_navigation_tools(mcp: FastMCP) -> None:
             return nav_result
         except Exception as e:
             result = {"ok": False, "error": str(e)}
-            log_tool_call(
-                "browser_go_back", params, error=e, duration_ms=(time.perf_counter() - start) * 1000
-            )
+            log_tool_call("browser_go_back", params, error=e, duration_ms=(time.perf_counter() - start) * 1000)
             return result
 
     @mcp.tool()
@@ -169,7 +179,7 @@ def register_navigation_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_go_forward", params, result=result)
             return result
 
@@ -224,7 +234,7 @@ def register_navigation_tools(mcp: FastMCP) -> None:
 
         ctx = _get_context(profile)
         if not ctx:
-            result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+            result = {"ok": False, "error": "Browser not started. Call browser_open(url) first to open a tab."}
             log_tool_call("browser_reload", params, result=result)
             return result
 
@@ -245,7 +255,5 @@ def register_navigation_tools(mcp: FastMCP) -> None:
             return nav_result
         except Exception as e:
             result = {"ok": False, "error": str(e)}
-            log_tool_call(
-                "browser_reload", params, error=e, duration_ms=(time.perf_counter() - start) * 1000
-            )
+            log_tool_call("browser_reload", params, error=e, duration_ms=(time.perf_counter() - start) * 1000)
             return result

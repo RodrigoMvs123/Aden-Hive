@@ -369,7 +369,6 @@ Port popular tools, and build out the Runtime Log, Audit Trail, Excel, and Email
     - [x] Subdomain Enumerator (tools/subdomain_enumerator/)
     - [x] Tech Stack Detector (tools/tech_stack_detector/)
 - [x] **Runtime & Logging**
-    - [x] Runtime Log Tool (tools/runtime_logs_tool/)
     - [x] Runtime Logger with L1/L2/L3 levels (runtime/runtime_logger.py)
 - [ ] **Audit Trail System**
     - [ ] Decision tracing beyond logs
@@ -802,8 +801,7 @@ Port the existing Terminal User Interface (TUI) into a rich web application, all
 ### Memory & State Inspector
 Create a UI component to inspect the Shared Memory and Write-Through Conversation Memory, allowing developers to click on any node and see exactly what it is thinking.
 
-- [x] **Runtime Logs Tool**
-    - [x] Inspect agent session logs (tools/runtime_logs_tool/)
+- [x] **Session State**
     - [x] Session state retrieval (builder/package_generator.py)
 - [ ] **Memory Inspector UI**
     - [ ] Shared Memory visualization

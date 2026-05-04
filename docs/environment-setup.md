@@ -110,7 +110,7 @@ MCP tools are also available in Cursor. To enable:
 
 **Claude Code:**
 ```
-Use the coder-tools initialize_and_build_agent tool to scaffold a new agent
+Use the files-tools initialize_and_build_agent tool to scaffold a new agent
 ```
 
 **Codex CLI:**
@@ -261,7 +261,7 @@ hive/
 │   └── pyproject.toml
 │
 ├── exports/                 # Agent packages (user-created, gitignored)
-│   └── your_agent_name/     # Created via coder-tools workflow
+│   └── your_agent_name/     # Created via files-tools workflow
 │
 └── examples/
     └── templates/           # Pre-built template agents
@@ -313,9 +313,9 @@ The `.mcp.json` at project root configures MCP servers to run through `uv run` i
 ```json
 {
   "mcpServers": {
-    "coder-tools": {
+    "files-tools": {
       "command": "uv",
-      "args": ["run", "coder_tools_server.py", "--stdio"],
+      "args": ["run", "files_server.py", "--stdio"],
       "cwd": "tools"
     },
     "tools": {
@@ -353,7 +353,7 @@ This design allows agents in `exports/` to be:
 ### 2. Build Agent (Claude Code)
 
 ```
-Use the coder-tools initialize_and_build_agent tool
+Use the files-tools initialize_and_build_agent tool
 Enter goal: "Build an agent that processes customer support tickets"
 ```
 
@@ -414,7 +414,7 @@ cd core && uv run python tests/dummy_agents/run_all.py --verbose
 | parallel_merge | 4     | Fan-out/fan-in, failure strategies                  |
 | retry          | 4     | Retry mechanics, exhaustion, `ON_FAILURE` edges     |
 | feedback_loop  | 3     | Feedback cycles, `max_node_visits`                  |
-| worker         | 4     | Real MCP tools (`example_tool`, `get_current_time`, `save_data`/`load_data`) |
+| worker         | 4     | Real MCP tools (`get_current_time`, `save_data`/`load_data`) |
 
 Typical runtime is 1–3 minutes depending on provider latency.
 
@@ -446,7 +446,7 @@ Quickstart also supports selecting OpenRouter and Hive LLM interactively. See [c
 # Fernet encryption key for credential store at ~/.hive/credentials
 export HIVE_CREDENTIAL_KEY="your-fernet-key"
 
-# Agent storage location (default: /tmp)
+# Agent storage location (default: ~/.hive/agents/{agent_name}/)
 export AGENT_STORAGE_PATH="/custom/storage"
 ```
 

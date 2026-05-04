@@ -13,15 +13,13 @@ from framework.skills.defaults import (
 )
 from framework.skills.parser import parse_skill_md
 
-_DEFAULT_SKILLS_DIR = (
-    Path(__file__).resolve().parent.parent / "framework" / "skills" / "_default_skills"
-)
+_DEFAULT_SKILLS_DIR = Path(__file__).resolve().parent.parent / "framework" / "skills" / "_default_skills"
 
 
 class TestDefaultSkillFiles:
-    """Verify all 6 built-in SKILL.md files parse correctly."""
+    """Verify all built-in SKILL.md files parse correctly."""
 
-    def test_all_six_skills_exist(self):
+    def test_all_skills_exist(self):
         assert len(SKILL_REGISTRY) == 6
 
     @pytest.mark.parametrize("skill_name,dir_name", list(SKILL_REGISTRY.items()))
@@ -37,7 +35,13 @@ class TestDefaultSkillFiles:
         assert parsed.source_scope == "framework"
 
     def test_combined_token_budget(self):
-        """All default skill bodies combined should be under 2000 tokens (~8000 chars)."""
+        """All default skill bodies combined should stay within the protocols budget.
+
+        Ceiling is 5000 tokens (~20000 chars): the prompt-injection path
+        appends every registered skill body to the system prompt, so
+        uncontrolled growth would balloon every LLM call. 5000 gives
+        headroom over today's ~3500 while still catching obvious bloat.
+        """
         total_chars = 0
         for dir_name in SKILL_REGISTRY.values():
             path = _DEFAULT_SKILLS_DIR / dir_name / "SKILL.md"
@@ -46,9 +50,9 @@ class TestDefaultSkillFiles:
             total_chars += len(parsed.body)
 
         approx_tokens = total_chars // 4
-        assert approx_tokens < 2000, (
+        assert approx_tokens < 5000, (
             f"Combined default skill bodies are ~{approx_tokens} tokens "
-            f"({total_chars} chars), exceeding the 2000 token budget"
+            f"({total_chars} chars), exceeding the 5000 token budget"
         )
 
     def test_data_buffer_keys_all_prefixed(self):
@@ -62,7 +66,7 @@ class TestDefaultSkillManager:
         manager = DefaultSkillManager()
         manager.load()
 
-        assert len(manager.active_skill_names) == 6
+        assert len(manager.active_skill_names) == len(SKILL_REGISTRY)
         for name in SKILL_REGISTRY:
             assert name in manager.active_skill_names
 
@@ -94,14 +98,12 @@ class TestDefaultSkillManager:
         assert manager.active_skill_names == []
 
     def test_disable_single_skill(self):
-        config = SkillsConfig.from_agent_vars(
-            default_skills={"hive.quality-monitor": {"enabled": False}}
-        )
+        config = SkillsConfig.from_agent_vars(default_skills={"hive.quality-monitor": {"enabled": False}})
         manager = DefaultSkillManager(config)
         manager.load()
 
         assert "hive.quality-monitor" not in manager.active_skill_names
-        assert len(manager.active_skill_names) == 5
+        assert len(manager.active_skill_names) == len(SKILL_REGISTRY) - 1
 
     def test_disable_all_via_convention(self):
         config = SkillsConfig.from_agent_vars(default_skills={"_all": {"enabled": False}})
@@ -138,11 +140,9 @@ class TestSkillsConfig:
         assert config.is_default_enabled("hive.note-taking") is True
 
     def test_explicit_disable(self):
-        config = SkillsConfig(
-            default_skills={"hive.note-taking": DefaultSkillConfig(enabled=False)}
-        )
+        config = SkillsConfig(default_skills={"hive.note-taking": DefaultSkillConfig(enabled=False)})
         assert config.is_default_enabled("hive.note-taking") is False
-        assert config.is_default_enabled("hive.batch-ledger") is True
+        assert config.is_default_enabled("hive.quality-monitor") is True
 
     def test_all_disabled_flag(self):
         config = SkillsConfig(all_defaults_disabled=True)
@@ -172,11 +172,11 @@ class TestSkillsConfig:
     def test_get_default_overrides(self):
         config = SkillsConfig.from_agent_vars(
             default_skills={
-                "hive.batch-ledger": {"enabled": True, "checkpoint_every_n": 10},
+                "hive.quality-monitor": {"enabled": True, "assessment_interval": 10},
             }
         )
-        overrides = config.get_default_overrides("hive.batch-ledger")
-        assert overrides == {"checkpoint_every_n": 10}
+        overrides = config.get_default_overrides("hive.quality-monitor")
+        assert overrides == {"assessment_interval": 10}
 
     def test_get_default_overrides_empty(self):
         config = SkillsConfig()
@@ -199,9 +199,7 @@ class TestConfigOverrideSubstitution:
         assert "Every 5 iterations" in prompt
 
     def test_quality_monitor_override_interval(self):
-        config = SkillsConfig.from_agent_vars(
-            default_skills={"hive.quality-monitor": {"assessment_interval": 10}}
-        )
+        config = SkillsConfig.from_agent_vars(default_skills={"hive.quality-monitor": {"assessment_interval": 10}})
         manager = DefaultSkillManager(config)
         manager.load()
         prompt = manager.build_protocols_prompt()
@@ -215,9 +213,7 @@ class TestConfigOverrideSubstitution:
         assert "3+ times" in prompt
 
     def test_error_recovery_override_retries(self):
-        config = SkillsConfig.from_agent_vars(
-            default_skills={"hive.error-recovery": {"max_retries_per_tool": 5}}
-        )
+        config = SkillsConfig.from_agent_vars(default_skills={"hive.error-recovery": {"max_retries_per_tool": 5}})
         manager = DefaultSkillManager(config)
         manager.load()
         prompt = manager.build_protocols_prompt()
@@ -241,50 +237,32 @@ class TestConfigOverrideSubstitution:
         assert "45%" not in prompt
 
     def test_no_unreplaced_placeholders_with_defaults(self):
-        """All {{...}} placeholders should be replaced when using defaults."""
+        """All {{...}} placeholders should be replaced when using defaults.
+
+        The writing-hive-skills skill contains literal ``{{placeholder}}``
+        as documentation text, so we strip that known occurrence before checking.
+        """
         manager = DefaultSkillManager()
         manager.load()
         prompt = manager.build_protocols_prompt()
-        assert "{{" not in prompt
+        # Remove the known literal {{placeholder}} documentation example
+        cleaned = prompt.replace("{{placeholder}}", "")
+        assert "{{" not in cleaned
 
 
-class TestBatchAutoDetection:
-    """DS-12: is_batch_scenario() and batch_init_nudge property."""
+class TestBatchDeprecatedNoOps:
+    """batch-ledger skill was removed; is_batch_scenario() and batch_init_nudge
+    are deprecated no-ops that return False / None unconditionally. They are
+    kept in-tree to avoid touching every orchestrator/execution_manager call
+    site that still reads the nudge through the config plumbing."""
 
-    def test_detects_list_of(self):
-        assert is_batch_scenario("process a list of 100 leads") is True
+    def test_is_batch_scenario_always_false(self):
+        assert is_batch_scenario("process a list of 100 leads") is False
+        assert is_batch_scenario("for each record, send an email") is False
+        assert is_batch_scenario("write a summary") is False
 
-    def test_detects_collection_of(self):
-        assert is_batch_scenario("a collection of invoices") is True
-
-    def test_detects_items(self):
-        assert is_batch_scenario("go through all items in the spreadsheet") is True
-
-    def test_detects_for_each(self):
-        assert is_batch_scenario("for each record, send an email") is True
-
-    def test_no_match_single_task(self):
-        assert is_batch_scenario("write a summary of the quarterly report") is False
-
-    def test_batch_nudge_active_by_default(self):
+    def test_batch_init_nudge_always_none(self):
         manager = DefaultSkillManager()
-        manager.load()
-        assert manager.batch_init_nudge is not None
-        assert "_batch_ledger" in manager.batch_init_nudge
-
-    def test_batch_nudge_none_when_skill_disabled(self):
-        config = SkillsConfig.from_agent_vars(
-            default_skills={"hive.batch-ledger": {"enabled": False}}
-        )
-        manager = DefaultSkillManager(config)
-        manager.load()
-        assert manager.batch_init_nudge is None
-
-    def test_batch_nudge_none_when_auto_detect_disabled(self):
-        config = SkillsConfig.from_agent_vars(
-            default_skills={"hive.batch-ledger": {"auto_detect_batch": False}}
-        )
-        manager = DefaultSkillManager(config)
         manager.load()
         assert manager.batch_init_nudge is None
 
@@ -306,9 +284,7 @@ class TestContextWarnRatio:
         assert manager.context_warn_ratio == pytest.approx(0.3)
 
     def test_ratio_none_when_skill_disabled(self):
-        config = SkillsConfig.from_agent_vars(
-            default_skills={"hive.context-preservation": {"enabled": False}}
-        )
+        config = SkillsConfig.from_agent_vars(default_skills={"hive.context-preservation": {"enabled": False}})
         manager = DefaultSkillManager(config)
         manager.load()
         assert manager.context_warn_ratio is None

@@ -24,12 +24,12 @@ export const executionApi = {
     sessionId: string,
     nodeId: string,
     content: string,
-    graphId?: string,
+    colonyId?: string,
   ) =>
     api.post<InjectResult>(`/sessions/${sessionId}/inject`, {
       node_id: nodeId,
       content,
-      graph_id: graphId,
+      colony_id: colonyId,
     }),
 
   chat: (
@@ -63,4 +63,39 @@ export const executionApi = {
 
   goalProgress: (sessionId: string) =>
     api.get<GoalProgress>(`/sessions/${sessionId}/goal-progress`),
+
+  colonySpawn: (sessionId: string, colonyName: string, task?: string) =>
+    api.post<{
+      colony_path: string;
+      colony_name: string;
+      queen_session_id: string;
+      is_new: boolean;
+    }>(
+      `/sessions/${sessionId}/colony-spawn`,
+      { colony_name: colonyName, task },
+    ),
+
+  /** Lock a queen DM session because the user opened a spawned colony.
+   *  After this call /chat returns 409 until compactAndFork creates a new session.
+   */
+  markColonySpawned: (sessionId: string, colonyName: string) =>
+    api.post<{
+      session_id: string;
+      colony_spawned: boolean;
+      spawned_colony_name: string;
+    }>(`/sessions/${sessionId}/mark-colony-spawned`, {
+      colony_name: colonyName,
+    }),
+
+  /** Compact the locked session and fork into a fresh session under the same queen.
+   *  Returns the new session ID; the frontend should navigate the user to it.
+   */
+  compactAndFork: (sessionId: string) =>
+    api.post<{
+      new_session_id: string;
+      queen_id: string;
+      compacted_from: string;
+      summary_chars: number;
+      messages_compacted: number;
+    }>(`/sessions/${sessionId}/compact-and-fork`),
 };

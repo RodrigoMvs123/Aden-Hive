@@ -70,6 +70,8 @@ tmp/
 temp/
 
 exports/*
+exports.old*
+artifacts/*
 
 .claude/settings.local.json
 
@@ -79,3 +81,4 @@ core/tests/*dumps/*
 screenshots/*
 
 .gemini/*
+.coverage

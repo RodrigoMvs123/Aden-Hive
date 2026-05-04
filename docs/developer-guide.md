@@ -99,7 +99,6 @@ hive/                                    # Repository root
 │   │   ├── storage/                     # File-based persistence
 │   │   ├── testing/                     # Testing utilities
 │   │   ├── tools/                       # Built-in tool implementations
-│   │   ├── tui/                         # Terminal UI dashboard
 │   │   └── utils/                       # Shared utilities
 │   ├── tests/                           # Unit and E2E tests (including dummy agents)
 │   ├── pyproject.toml                   # Package metadata and dependencies
@@ -120,7 +119,7 @@ hive/                                    # Repository root
 │   └── README.md                        # Tools documentation
 │
 ├── exports/                             # AGENT PACKAGES (user-created, gitignored)
-│   └── your_agent_name/                 # Created via coder-tools workflow
+│   └── your_agent_name/                 # Created via files-tools workflow
 │
 ├── examples/                            # Example agents
 │   └── templates/                       # Pre-built template agents
@@ -158,7 +157,7 @@ The fastest way to build agents is with the configured MCP workflow:
 ./quickstart.sh
 
 # Build a new agent
-Use the coder-tools MCP tools from your IDE agent chat (e.g., initialize_and_build_agent)
+Use the files-tools MCP tools from your IDE agent chat (e.g., initialize_and_build_agent)
 ```
 
 ### Agent Development Workflow
@@ -166,7 +165,7 @@ Use the coder-tools MCP tools from your IDE agent chat (e.g., initialize_and_bui
 1. **Define Your Goal**
 
    ```
-   Use the coder-tools initialize_and_build_agent tool
+   Use the files-tools initialize_and_build_agent tool
    Enter goal: "Build an agent that processes customer support tickets"
    ```
 
@@ -570,7 +569,7 @@ uv add <package>
 
 ```bash
 # Option 1: Use Claude Code skill (recommended)
-Use the coder-tools initialize_and_build_agent tool
+Use the files-tools initialize_and_build_agent tool
 
 # Option 2: Create manually
 # Note: exports/ is initially empty (gitignored). Create your agent directory:
@@ -578,7 +577,7 @@ mkdir -p exports/my_new_agent
 cd exports/my_new_agent
 # Create agent.json, tools.py, README.md (see Agent Package Structure below)
 
-# Option 3: Use the coder-tools MCP tools (advanced)
+# Option 3: Use the files-tools MCP tools (advanced)
 # See core/MCP_BUILDER_TOOLS_GUIDE.md
 ```
 

@@ -1,21 +1,20 @@
-"""Reflect agent — background memory extraction for queen and worker memory.
+"""Reflection agent — background memory extraction for the queen.
 
-A lightweight side agent that runs after each queen LLM turn.  It
-inspects recent conversation messages (cursor-based incremental
-processing) and extracts learnings into individual memory files.
+A lightweight side agent that runs after each queen LLM turn.  It inspects
+recent conversation messages and extracts durable user knowledge into
+individual memory files in the configured memory directories.
 
 Two reflection types:
-  - **Short reflection**: every queen turn. Distills learnings. Nudged
-    toward a 2-turn pattern (batch reads → batch writes).
-  - **Long reflection**: every 5 short reflections, on CONTEXT_COMPACTED,
-    and at session end.  Organises, deduplicates, trims holistically.
+  - **Short reflection**: after conversational queen turns.  Distills
+    learnings into either global or queen-scoped memory.
+  - **Long reflection**: every 5 short reflections and on CONTEXT_COMPACTED.
+    Organises, deduplicates, and trims a memory directory.
 
-The agent has restricted tool access: it can only read/write/delete
-memory files in ``~/.hive/queen/memories/`` and list them.
+Concurrency: an ``asyncio.Lock`` prevents overlapping runs.  If a trigger
+fires while a reflection is already active the event is skipped.
 
-Concurrency: an ``asyncio.Lock`` prevents overlapping runs.  If a
-trigger fires while a reflection is already active the event is skipped
-(cursor hasn't advanced, so messages will be reconsidered next time).
+All reflections are fire-and-forget (spawned via ``asyncio.create_task``)
+so they never block the queen's event loop.
 """
 
 from __future__ import annotations
@@ -23,26 +22,23 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from framework.agents.queen.queen_memory_v2 import (
+    GLOBAL_MEMORY_CATEGORIES,
     MAX_FILE_SIZE_BYTES,
     MAX_FILES,
-    MEMORY_DIR,
-    MEMORY_FRONTMATTER_EXAMPLE,
-    MEMORY_TYPES,
-    build_diary_document,
-    diary_filename,
     format_memory_manifest,
+    global_memory_dir as _default_global_memory_dir,
     parse_frontmatter,
-    read_conversation_parts,
     scan_memory_files,
 )
 from framework.llm.provider import LLMResponse, Tool
+from framework.tracker.llm_debug_logger import log_llm_turn
 
 logger = logging.getLogger(__name__)
 
@@ -54,24 +50,33 @@ _REFLECTION_TOOLS: list[Tool] = [
     Tool(
         name="list_memory_files",
         description=(
-            "List all memory files with their type, name, age, and description. "
-            "Returns a text manifest — one line per file."
+            "List memory files with their type, name, and description. "
+            "When scope is omitted, returns all scopes grouped by scope."
         ),
         parameters={
             "type": "object",
-            "properties": {},
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "description": "Optional scope to inspect: 'global' or 'queen'.",
+                },
+            },
             "additionalProperties": False,
         },
     ),
     Tool(
         name="read_memory_file",
-        description="Read the full content of a memory file by filename.",
+        description="Read the full content of a memory file by filename from a scope.",
         parameters={
             "type": "object",
             "properties": {
                 "filename": {
                     "type": "string",
                     "description": "The filename (e.g. 'user-prefers-dark-mode.md').",
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "Memory scope: 'global' or 'queen'. Defaults to 'global'.",
                 },
             },
             "required": ["filename"],
@@ -92,6 +97,10 @@ _REFLECTION_TOOLS: list[Tool] = [
                     "type": "string",
                     "description": "Filename ending in .md (e.g. 'user-prefers-dark-mode.md').",
                 },
+                "scope": {
+                    "type": "string",
+                    "description": "Memory scope: 'global' or 'queen'. Defaults to 'global'.",
+                },
                 "content": {
                     "type": "string",
                     "description": "Full file content including frontmatter.",
@@ -104,8 +113,7 @@ _REFLECTION_TOOLS: list[Tool] = [
     Tool(
         name="delete_memory_file",
         description=(
-            "Delete a memory file by filename.  Use during long "
-            "reflection to prune stale or redundant memories."
+            "Delete a memory file by filename.  Use during long reflection to prune stale or redundant memories."
         ),
         parameters={
             "type": "object",
@@ -114,12 +122,68 @@ _REFLECTION_TOOLS: list[Tool] = [
                     "type": "string",
                     "description": "The filename to delete.",
                 },
+                "scope": {
+                    "type": "string",
+                    "description": "Memory scope: 'global' or 'queen'. Defaults to 'global'.",
+                },
             },
             "required": ["filename"],
             "additionalProperties": False,
         },
     ),
 ]
+
+
+def _normalize_memory_dirs(
+    memory_dir: Path | dict[str, Path],
+    *,
+    queen_memory_dir: Path | None = None,
+) -> dict[str, Path]:
+    """Normalize memory directory input into a scope -> path mapping."""
+    if isinstance(memory_dir, dict):
+        return {scope: path for scope, path in memory_dir.items() if path is not None}
+
+    dirs: dict[str, Path] = {"global": memory_dir}
+    if queen_memory_dir is not None:
+        dirs["queen"] = queen_memory_dir
+    return dirs
+
+
+def _scope_label(scope: str, queen_id: str | None = None) -> str:
+    """Human-readable label for a memory scope."""
+    if scope == "queen":
+        return f"queen ({queen_id})" if queen_id else "queen"
+    return scope
+
+
+def _resolve_memory_scope(args: dict[str, Any], memory_dirs: dict[str, Path]) -> str:
+    """Resolve and validate the requested memory scope."""
+    raw_scope = args.get("scope")
+    if raw_scope is None:
+        if len(memory_dirs) == 1:
+            return next(iter(memory_dirs))
+        scope = "global"
+    else:
+        scope = str(raw_scope).strip().lower() or "global"
+    if scope not in memory_dirs:
+        available = ", ".join(sorted(memory_dirs))
+        raise ValueError(f"Invalid scope '{scope}'. Available scopes: {available}.")
+    return scope
+
+
+def _format_multi_scope_manifest(
+    memory_dirs: dict[str, Path],
+    *,
+    queen_id: str | None = None,
+) -> str:
+    """Format a manifest that groups memory files by scope."""
+    blocks: list[str] = []
+    for scope, memory_dir in memory_dirs.items():
+        files = scan_memory_files(memory_dir)
+        label = _scope_label(scope, queen_id)
+        body = format_memory_manifest(files) if files else "(no memory files yet)"
+        blocks.append(f"## Scope: {label}\n\n{body}")
+    return "\n\n".join(blocks)
 
 
 def _safe_memory_path(filename: str, memory_dir: Path) -> Path:
@@ -135,44 +199,41 @@ def _safe_memory_path(filename: str, memory_dir: Path) -> Path:
     return candidate
 
 
-# Memory types that workers are NOT allowed to write.
-_WORKER_BLOCKED_TYPES: frozenset[str] = frozenset(
-    {"environment", "technique", "reference", "diary", "goal"}
-)
-
-
-def _inject_last_modified_by(content: str, caller: str) -> str:
-    """Inject or update ``last_modified_by`` in frontmatter."""
-    m = re.match(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
-    if not m:
-        return content
-    fm_body = m.group(1)
-    # Remove existing last_modified_by line if present.
-    fm_lines = [
-        ln for ln in fm_body.splitlines() if not ln.strip().lower().startswith("last_modified_by")
-    ]
-    fm_lines.append(f"last_modified_by: {caller}")
-    new_fm = "\n".join(fm_lines)
-    return f"---\n{new_fm}\n---{content[m.end() :]}"
-
-
-def _execute_tool(name: str, args: dict[str, Any], memory_dir: Path, caller: str) -> str:
+def _execute_tool(
+    name: str,
+    args: dict[str, Any],
+    memory_dir: Path | dict[str, Path],
+    *,
+    queen_id: str | None = None,
+) -> str:
     """Execute a reflection tool synchronously.  Returns the result string."""
+    memory_dirs = _normalize_memory_dirs(memory_dir)
     if name == "list_memory_files":
-        files = scan_memory_files(memory_dir)
-        logger.debug("reflect: tool list_memory_files → %d files", len(files))
-        if not files:
-            return "(no memory files yet)"
-        return format_memory_manifest(files)
+        requested_scope = args.get("scope")
+        if requested_scope is not None:
+            try:
+                scope = _resolve_memory_scope(args, memory_dirs)
+            except ValueError as exc:
+                return f"ERROR: {exc}"
+            files = scan_memory_files(memory_dirs[scope])
+            logger.debug("reflect: tool list_memory_files[%s] → %d files", scope, len(files))
+            if not files:
+                return f"(no {scope} memory files yet)"
+            return format_memory_manifest(files)
+        return _format_multi_scope_manifest(memory_dirs, queen_id=queen_id)
 
     if name == "read_memory_file":
         filename = args.get("filename", "")
         try:
-            path = _safe_memory_path(filename, memory_dir)
+            scope = _resolve_memory_scope(args, memory_dirs)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+        try:
+            path = _safe_memory_path(filename, memory_dirs[scope])
         except ValueError as exc:
             return f"ERROR: {exc}"
         if not path.exists() or not path.is_file():
-            return f"ERROR: File not found: {filename}"
+            return f"ERROR: File not found in {scope}: {filename}"
         try:
             return path.read_text(encoding="utf-8")
         except OSError as e:
@@ -181,50 +242,88 @@ def _execute_tool(name: str, args: dict[str, Any], memory_dir: Path, caller: str
     if name == "write_memory_file":
         filename = args.get("filename", "")
         content = args.get("content", "")
+        try:
+            scope = _resolve_memory_scope(args, memory_dirs)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+        scope_dir = memory_dirs[scope]
         if not filename.endswith(".md"):
             return "ERROR: Filename must end with .md"
-        # Enforce caller-based type restrictions.
+        # Enforce global memory type restrictions.
         fm = parse_frontmatter(content)
         mem_type = (fm.get("type") or "").strip().lower()
-        if caller == "worker" and mem_type in _WORKER_BLOCKED_TYPES:
-            return (
-                f"ERROR: Workers cannot write memory type '{mem_type}'. "
-                f"Blocked types for workers: {', '.join(sorted(_WORKER_BLOCKED_TYPES))}."
-            )
-        # Inject last_modified_by into frontmatter.
-        content = _inject_last_modified_by(content, caller)
+        if mem_type and mem_type not in GLOBAL_MEMORY_CATEGORIES:
+            return f"ERROR: Invalid memory type '{mem_type}'. Allowed types: {', '.join(GLOBAL_MEMORY_CATEGORIES)}."
         # Enforce file size limit.
         if len(content.encode("utf-8")) > MAX_FILE_SIZE_BYTES:
             return f"ERROR: Content exceeds {MAX_FILE_SIZE_BYTES} byte limit."
         # Enforce file cap (only for new files).
         try:
-            path = _safe_memory_path(filename, memory_dir)
+            path = _safe_memory_path(filename, scope_dir)
         except ValueError as exc:
             return f"ERROR: {exc}"
         if not path.exists():
-            existing = list(memory_dir.glob("*.md"))
+            existing = list(scope_dir.glob("*.md"))
             if len(existing) >= MAX_FILES:
-                return f"ERROR: File cap reached ({MAX_FILES}).  Delete a file first."
-        memory_dir.mkdir(parents=True, exist_ok=True)
+                return f"ERROR: File cap reached in {scope} ({MAX_FILES}). Delete a file first."
+        scope_dir.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         logger.debug(
-            "reflect: tool write_memory_file [%s] → %s (%d chars)", caller, filename, len(content)
+            "reflect: tool write_memory_file[%s] → %s (%d chars)",
+            scope,
+            filename,
+            len(content),
         )
-        return f"Wrote {filename} ({len(content)} chars)."
+        return f"Wrote {scope}:{filename} ({len(content)} chars)."
 
     if name == "delete_memory_file":
         filename = args.get("filename", "")
         try:
-            path = _safe_memory_path(filename, memory_dir)
+            scope = _resolve_memory_scope(args, memory_dirs)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+        try:
+            path = _safe_memory_path(filename, memory_dirs[scope])
         except ValueError as exc:
             return f"ERROR: {exc}"
         if not path.exists():
-            return f"ERROR: File not found: {filename}"
+            return f"ERROR: File not found in {scope}: {filename}"
         path.unlink()
-        logger.debug("reflect: tool delete_memory_file [%s] → %s", caller, filename)
-        return f"Deleted {filename}."
+        logger.debug("reflect: tool delete_memory_file[%s] → %s", scope, filename)
+        return f"Deleted {scope}:{filename}."
 
     return f"ERROR: Unknown tool: {name}"
+
+
+# ---------------------------------------------------------------------------
+# Reflection logging helper
+# ---------------------------------------------------------------------------
+
+
+def _log_reflection_turn(
+    *,
+    reflection_id: str,
+    iteration: int,
+    system_prompt: str,
+    messages: list[dict[str, Any]],
+    assistant_text: str,
+    tool_calls: list[dict[str, Any]],
+    tool_results: list[dict[str, Any]],
+    token_counts: dict[str, Any],
+) -> None:
+    """Log a reflection turn using the same JSONL format as the main agent loop."""
+    log_llm_turn(
+        node_id="reflection",
+        stream_id=reflection_id,
+        execution_id=reflection_id,
+        iteration=iteration,
+        system_prompt=system_prompt,
+        messages=messages,
+        assistant_text=assistant_text,
+        tool_calls=tool_calls,
+        tool_results=tool_results,
+        token_counts=token_counts,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -238,37 +337,24 @@ async def _reflection_loop(
     llm: Any,
     system: str,
     user_msg: str,
-    memory_dir: Path,
-    caller: str,
+    memory_dir: Path | dict[str, Path],
     max_turns: int = _MAX_TURNS,
+    *,
+    queen_id: str | None = None,
 ) -> tuple[bool, list[str], str]:
     """Run a mini tool-use loop: LLM → tool calls → repeat.
 
-    Hard cap of *max_turns* iterations.  Prompt nudges the LLM toward a
-    2-turn pattern (batch reads in turn 1, batch writes in turn 2).
-
-    Returns a tuple of (success, changed_files, last_text) where *success*
-    is ``True`` if the loop completed without LLM errors, *changed_files*
-    lists filenames that were written or deleted, and *last_text* is the
-    final assistant text (useful as a skip-reason when no files changed).
+    Returns (success, changed_files, last_text).
     """
     messages: list[dict[str, Any]] = [{"role": "user", "content": user_msg}]
     changed_files: list[str] = []
     last_text: str = ""
-    logger.debug("reflect: starting loop (caller=%s, max %d turns)", caller, max_turns)
+    reflection_id = f"reflection_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    token_counts: dict[str, Any] = {}
+    memory_dirs = _normalize_memory_dirs(memory_dir)
 
     for _turn in range(max_turns):
-        # Log what we're sending to the LLM.
-        user_content = messages[-1].get("content", "") if messages else ""
-        preview = user_content[:300] if isinstance(user_content, str) else str(user_content)[:300]
-        logger.debug(
-            "reflect: turn %d — sending %d messages to LLM, last msg role=%s, preview=%s",
-            _turn,
-            len(messages),
-            messages[-1].get("role", "?") if messages else "?",
-            preview,
-        )
-
+        logger.info("reflect: loop turn %d/%d (msgs=%d)", _turn + 1, max_turns, len(messages))
         try:
             resp: LLMResponse = await llm.acomplete(
                 messages=messages,
@@ -276,45 +362,64 @@ async def _reflection_loop(
                 tools=_REFLECTION_TOOLS,
                 max_tokens=2048,
             )
+        except asyncio.CancelledError:
+            logger.warning("reflect: LLM call cancelled (task cancelled)")
+            return False, changed_files, last_text
         except Exception:
             logger.warning("reflect: LLM call failed", exc_info=True)
             return False, changed_files, last_text
 
-        # Build assistant message.
+        # Extract tool calls from litellm/OpenAI response object.
         tool_calls_raw: list[dict[str, Any]] = []
-        if resp.raw_response and isinstance(resp.raw_response, dict):
-            tool_calls_raw = resp.raw_response.get("tool_calls", [])
+        raw = resp.raw_response
+        if raw is not None:
+            # litellm returns a ModelResponse object; tool calls live on
+            # choices[0].message.tool_calls as a list of ChatCompletionMessageToolCall.
+            try:
+                msg_obj = raw.choices[0].message
+                if hasattr(msg_obj, "tool_calls") and msg_obj.tool_calls:
+                    for tc in msg_obj.tool_calls:
+                        fn = tc.function
+                        try:
+                            args = json.loads(fn.arguments) if fn.arguments else {}
+                        except (json.JSONDecodeError, TypeError):
+                            args = {}
+                        tool_calls_raw.append(
+                            {
+                                "id": tc.id,
+                                "name": fn.name,
+                                "input": args,
+                            }
+                        )
+            except (AttributeError, IndexError):
+                pass
 
-        # Log the full LLM response for debugging.
-        raw_keys = (
-            list(resp.raw_response.keys())
-            if isinstance(resp.raw_response, dict)
-            else type(resp.raw_response).__name__
-        )
-        logger.debug(
-            "reflect: turn %d — LLM response: content=%r (len=%d), stop_reason=%s, "
-            "tool_calls=%d, model=%s, tokens=%d/%d, raw_keys=%s",
-            _turn,
-            (resp.content or "")[:200],
+        logger.info(
+            "reflect: LLM responded, text=%d chars, tool_calls=%d",
             len(resp.content or ""),
-            resp.stop_reason,
             len(tool_calls_raw),
-            resp.model,
-            resp.input_tokens,
-            resp.output_tokens,
-            raw_keys,
         )
-        # Accumulate non-empty text across turns so we don't lose a reason
-        # given alongside tool calls on an earlier turn.
+
+        # Capture token counts from the LLM response.
+        try:
+            raw_usage = getattr(raw, "usage", None) if raw else None
+            if raw_usage:
+                token_counts = {
+                    "model": getattr(raw, "model", ""),
+                    "input": getattr(raw_usage, "prompt_tokens", 0) or 0,
+                    "output": getattr(raw_usage, "completion_tokens", 0) or 0,
+                    "cached": getattr(raw_usage, "prompt_tokens_details", None)
+                    and getattr(raw_usage.prompt_tokens_details, "cached_tokens", 0),
+                    "stop_reason": getattr(raw.choices[0], "finish_reason", "") if raw else "",
+                }
+        except Exception:
+            token_counts = {}
+
         turn_text = resp.content or ""
         if turn_text:
             last_text = turn_text
-        assistant_msg: dict[str, Any] = {
-            "role": "assistant",
-            "content": turn_text,
-        }
+        assistant_msg: dict[str, Any] = {"role": "assistant", "content": turn_text}
         if tool_calls_raw:
-            # Convert to OpenAI format for the conversation.
             assistant_msg["tool_calls"] = [
                 {
                     "id": tc["id"],
@@ -328,32 +433,35 @@ async def _reflection_loop(
             ]
         messages.append(assistant_msg)
 
-        # No tool calls → agent is done.
         if not tool_calls_raw:
-            logger.debug("reflect: loop done after %d turn(s) (no tool calls)", _turn + 1)
             break
 
-        # Execute each tool call and append results.
-        logger.debug(
-            "reflect: turn %d — executing %d tool call(s): %s",
-            _turn + 1,
-            len(tool_calls_raw),
-            [tc["name"] for tc in tool_calls_raw],
-        )
+        tool_results: list[dict[str, Any]] = []
         for tc in tool_calls_raw:
-            result = _execute_tool(tc["name"], tc.get("input", {}), memory_dir, caller)
-            # Track files that were written or deleted.
+            tc_input = tc.get("input", {})
+            result = _execute_tool(tc["name"], tc_input, memory_dirs, queen_id=queen_id)
             if tc["name"] in ("write_memory_file", "delete_memory_file"):
-                fname = tc.get("input", {}).get("filename", "")
+                fname = tc_input.get("filename", "")
+                try:
+                    scope = _resolve_memory_scope(tc_input, memory_dirs)
+                except ValueError:
+                    scope = str(tc_input.get("scope", "global")).strip().lower() or "global"
                 if fname and not result.startswith("ERROR"):
-                    changed_files.append(fname)
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": result,
-                }
-            )
+                    changed_files.append(f"{scope}:{fname}")
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+            tool_results.append({"tool_call_id": tc["id"], "name": tc["name"], "result": result})
+
+        # Log the reflection turn in the same JSONL format as the main agent loop.
+        _log_reflection_turn(
+            reflection_id=reflection_id,
+            iteration=_turn,
+            system_prompt=system,
+            messages=messages,
+            assistant_text=turn_text,
+            tool_calls=tool_calls_raw,
+            tool_results=tool_results,
+            token_counts=token_counts,
+        )
 
     return True, changed_files, last_text
 
@@ -362,87 +470,104 @@ async def _reflection_loop(
 # System prompts
 # ---------------------------------------------------------------------------
 
-_FRONTMATTER_EXAMPLE = "\n".join(MEMORY_FRONTMATTER_EXAMPLE)
+_CATEGORIES_STR = ", ".join(GLOBAL_MEMORY_CATEGORIES)
 
-_SHORT_REFLECT_SYSTEM = f"""\
-You are a reflection agent that distills learnings from a conversation into
-persistent memory files.  You run in the background after each assistant turn.
 
-Your goal: identify anything from the recent messages worth remembering across
-future sessions — user preferences, project context, techniques that worked,
-goals, environment details, reference pointers.
+def _build_unified_short_reflect_system(queen_id: str | None = None) -> str:
+    """Build the unified short reflection prompt across memory scopes."""
+    queen_scope = (
+        f"- `queen`: durable learnings specific to how queen '{queen_id}' should work with this user\n"
+        if queen_id
+        else ""
+    )
+    return f"""\
+You are a reflection agent that distills durable knowledge about the USER
+into persistent memory files. You run in the background after each
+assistant turn.
 
-Memory types: {", ".join(MEMORY_TYPES)}
+Memory categories: {_CATEGORIES_STR}
+
+Available memory scopes:
+- `global`: durable user facts that should help every queen in future sessions
+{queen_scope}
 
 Expected format for each memory file:
-{_FRONTMATTER_EXAMPLE}
+```markdown
+---
+name: {{{{memory name}}}}
+description: {{{{one-line description — specific and search-friendly}}}}
+type: {{{{{_CATEGORIES_STR}}}}}
+---
+
+{{{{memory content}}}}
+```
 
 Workflow (aim for 2 turns):
-  Turn 1 — call list_memory_files to see what already exists, then
-            read_memory_file for any that might need updating.
-  Turn 2 — call write_memory_file for new/updated memories.
+  Turn 1 — call list_memory_files without a scope to inspect all scopes, then
+            read_memory_file for any files that might need updating.
+  Turn 2 — call write_memory_file / delete_memory_file with an explicit scope.
 
 Rules:
-- Only persist information that would be useful in a *future* conversation.
-  Skip ephemeral task details, routine tool output, and anything obvious
-  from the code or git history.
-- Keep files concise.  Each file should cover ONE topic.
-- If an existing memory already covers the learning, UPDATE it rather than
-  creating a duplicate.
-- If there is nothing worth remembering from these messages, do nothing
-  (respond with a brief reason why nothing was saved — no tool calls needed).
-- IMPORTANT: Always end with a text message (no tool calls) summarising what
-  you did or why you skipped.  Never end on an empty response.
+- Make ONE coordinated storage decision per learning.
+- Prefer `global` for broad user facts: identity, general preferences, environment,
+  and feedback that should help all queens.
+- Prefer `queen` only for stable domain-specific learnings about how this queen
+  should reason, prioritize, communicate, or make tradeoffs for this user.
+- Avoid storing the same fact in both scopes unless the scoped version adds
+  genuinely distinct queen-specific nuance. When in doubt, keep only one copy.
+- Update existing files instead of creating duplicates when possible.
+- If the same learning already exists in the wrong scope or both scopes,
+  you may update one file and delete the redundant one.
+- Do NOT store task-specific details, code patterns, file paths, or ephemeral
+  session state.
+- Keep files concise. Each file should cover ONE topic.
+- If there is nothing worth remembering, do nothing (respond with a brief
+  reason — no tool calls needed).
 - File names should be kebab-case slugs ending in .md.
-- Include a specific, search-friendly description in the frontmatter.
-- Do NOT exceed {MAX_FILE_SIZE_BYTES} bytes per file or {MAX_FILES} total files.
+- For user identity/profile information about the human user (name, role,
+  background), ALWAYS use the canonical filename 'user-profile.md' in the
+  `global` scope. This is the single source of truth for user profile data,
+  shared with the settings UI.
+- When updating `global:user-profile.md`, preserve the '## User Identity'
+  section — it is managed by the settings UI. Never describe the assistant,
+  queen, or agent as the identity in this file. Add/update other sections
+  below it.
+- Do NOT exceed {MAX_FILE_SIZE_BYTES} bytes per file or {MAX_FILES} total files per scope.
 """
 
-_LONG_REFLECT_SYSTEM = f"""\
+
+def _build_unified_long_reflect_system(queen_id: str | None = None) -> str:
+    """Build the unified housekeeping prompt across memory scopes."""
+    queen_scope = (
+        f"- `queen`: memories specific to how queen '{queen_id}' should work with this user\n" if queen_id else ""
+    )
+    return f"""\
 You are a reflection agent performing a periodic housekeeping pass over the
-memory directory.  Your job is to organise, deduplicate, and trim noise from
-the accumulated memory files.
+memory system for this user.
 
-Memory types: {", ".join(MEMORY_TYPES)}
+Memory categories: {_CATEGORIES_STR}
 
-Expected format for each memory file:
-{_FRONTMATTER_EXAMPLE}
+Available memory scopes:
+- `global`: facts useful to every queen
+{queen_scope}
 
 Workflow:
-  1. list_memory_files to get the full manifest.
-  2. read_memory_file for files that look redundant, stale, or overlapping.
-  3. Merge duplicates, delete stale entries, consolidate related memories.
+  1. Call list_memory_files without a scope to inspect all scopes together.
+  2. Read files that look redundant, stale, overlapping, or misplaced.
+  3. Merge duplicates, move memories to the correct scope, and delete
+     redundant copies when appropriate.
   4. Ensure descriptions are specific and search-friendly.
-  5. Enforce limits: max {MAX_FILES} files, max {MAX_FILE_SIZE_BYTES} bytes each.
+  5. Enforce limits: max {MAX_FILES} files and {MAX_FILE_SIZE_BYTES} bytes per file in each scope.
 
 Rules:
-- Prefer merging over deleting — combine related memories into one file.
-- Remove memories that are no longer relevant or are superseded.
+- Treat deduplication across scopes as part of the job, not just within a scope.
+- Prefer `global` for broad durable user facts and `queen` for queen-specific nuance.
+- If two files store materially the same fact, keep the best one and delete or
+  rewrite the redundant one.
+- Prefer merging over deleting when the memories contain complementary signal.
+- Remove memories that are stale, superseded, or misplaced.
 - Keep the total collection lean and high-signal.
 - Do NOT invent new information — only reorganise what exists.
-- Do NOT delete or merge MEMORY-*.md diary files. These are daily narratives
-  managed by a separate process. You may read them for context but should not
-  modify them.
-"""
-
-_DIARY_SYSTEM = """\
-You maintain a daily diary entry for an AI colony session. You receive:
-(1) Today's existing diary content (may be empty if this is the first entry).
-(2) A transcript of recent conversation messages.
-
-Write a cohesive 3-8 sentence narrative about what happened in this session today.
-Cover: what the user asked for, what was accomplished, key decisions or obstacles,
-and current status.
-
-Rules:
-- If an existing diary is provided, rewrite it as a unified narrative incorporating
-  the new developments. Merge and deduplicate — do not simply append.
-- Keep the total narrative under 3000 characters.
-- Focus on the story arc of the day, not individual tool calls or code details.
-- If the recent messages contain nothing substantive (greetings, routine
-  confirmations), return the existing diary text unchanged.
-- Output only the diary prose. No headings, no timestamps, no code fences, no
-  frontmatter.
 """
 
 
@@ -451,31 +576,101 @@ Rules:
 # ---------------------------------------------------------------------------
 
 
+async def _read_conversation_parts(session_dir: Path) -> list[dict[str, Any]]:
+    """Read conversation parts from the queen session directory."""
+    from framework.storage.conversation_store import FileConversationStore
+
+    store = FileConversationStore(session_dir / "conversations")
+    return await store.read_parts()
+
+
 async def run_short_reflection(
     session_dir: Path,
     llm: Any,
     memory_dir: Path | None = None,
-    *,
-    caller: str,
 ) -> None:
-    """Run a short reflection: extract learnings from conversation."""
-    mem_dir = memory_dir or MEMORY_DIR
+    """Run a global-only short reflection (compatibility wrapper)."""
+    logger.info("reflect: starting global short reflection for %s", session_dir)
+    mem_dir = memory_dir or _default_global_memory_dir()
+    await _run_short_reflection_with_prompt(
+        session_dir,
+        llm,
+        mem_dir,
+        system_prompt=_build_unified_short_reflect_system(),
+        log_label="global",
+        queen_id=None,
+    )
 
-    messages = await read_conversation_parts(session_dir)
+
+async def run_queen_short_reflection(
+    session_dir: Path,
+    llm: Any,
+    queen_id: str,
+    memory_dir: Path,
+) -> None:
+    """Run a queen-only short reflection (compatibility wrapper)."""
+    logger.info("reflect: starting queen short reflection for %s (%s)", session_dir, queen_id)
+    await _run_short_reflection_with_prompt(
+        session_dir,
+        llm,
+        {"queen": memory_dir},
+        system_prompt=_build_unified_short_reflect_system(queen_id),
+        log_label=f"queen:{queen_id}",
+        queen_id=queen_id,
+    )
+
+
+async def run_unified_short_reflection(
+    session_dir: Path,
+    llm: Any,
+    *,
+    global_memory_dir: Path | None = None,
+    queen_memory_dir: Path | None = None,
+    queen_id: str | None = None,
+) -> None:
+    """Run one short reflection loop over all active memory scopes."""
+    global_dir = global_memory_dir or _default_global_memory_dir()
+    memory_dirs = {"global": global_dir}
+    if queen_memory_dir is not None and queen_id:
+        memory_dirs["queen"] = queen_memory_dir
+
+    logger.info(
+        "reflect: starting unified short reflection for %s (scopes=%s)",
+        session_dir,
+        sorted(memory_dirs),
+    )
+    await _run_short_reflection_with_prompt(
+        session_dir,
+        llm,
+        memory_dirs,
+        system_prompt=_build_unified_short_reflect_system(queen_id if "queen" in memory_dirs else None),
+        log_label="unified",
+        queen_id=queen_id if "queen" in memory_dirs else None,
+    )
+
+
+async def _run_short_reflection_with_prompt(
+    session_dir: Path,
+    llm: Any,
+    memory_dir: Path | dict[str, Path],
+    *,
+    system_prompt: str,
+    log_label: str,
+    queen_id: str | None,
+) -> None:
+    """Run a short reflection with a scope-specific system prompt."""
+    mem_dir = memory_dir
+
+    messages = await _read_conversation_parts(session_dir)
     if not messages:
-        logger.debug("reflect: short [%s] — no conversation parts", caller)
+        logger.info("reflect: no conversation parts found in %s, skipping", session_dir)
         return
 
-    logger.debug("reflect: short [%s] — %d conversation parts", caller, len(messages))
-
-    # Build a readable transcript from recent messages.
     transcript_lines: list[str] = []
     for msg in messages[-50:]:
         role = msg.get("role", "")
         content = str(msg.get("content", "")).strip()
-        if role == "tool":
-            continue  # Skip verbose tool results.
-        if not content:
+        if role == "tool" or not content:
             continue
         label = "user" if role == "user" else "assistant"
         if len(content) > 800:
@@ -483,6 +678,7 @@ async def run_short_reflection(
         transcript_lines.append(f"[{label}]: {content}")
 
     if not transcript_lines:
+        logger.info("reflect: no transcript lines after filtering, skipping")
         return
 
     transcript = "\n".join(transcript_lines)
@@ -494,18 +690,18 @@ async def run_short_reflection(
 
     _, changed, reason = await _reflection_loop(
         llm,
-        _SHORT_REFLECT_SYSTEM,
+        system_prompt,
         user_msg,
         mem_dir,
-        caller=caller,
+        queen_id=queen_id,
     )
     if changed:
-        logger.debug("reflect: short reflection done [%s], changed files: %s", caller, changed)
+        logger.info("reflect: %s short reflection done, changed files: %s", log_label, changed)
     else:
-        logger.debug(
-            "reflect: short reflection done [%s], no changes — %s",
-            caller,
-            reason or "no reason given",
+        logger.info(
+            "reflect: %s short reflection done, no changes — %s",
+            log_label,
+            reason or "no reason",
         )
 
 
@@ -513,17 +709,17 @@ async def run_long_reflection(
     llm: Any,
     memory_dir: Path | None = None,
     *,
-    caller: str,
+    scope_label: str = "global",
 ) -> None:
-    """Run a long reflection: organise and deduplicate all memories."""
-    mem_dir = memory_dir or MEMORY_DIR
+    """Run a single-scope long reflection (compatibility wrapper)."""
+    logger.debug("reflect: starting long reflection for %s", scope_label)
+    mem_dir = memory_dir or _default_global_memory_dir()
     files = scan_memory_files(mem_dir)
 
     if not files:
-        logger.debug("reflect: long [%s] — no memory files to organise", caller)
+        logger.debug("reflect: no %s memory files, skipping long reflection", scope_label)
         return
 
-    logger.debug("reflect: long [%s] — organising %d memory files", caller, len(files))
     manifest = format_memory_manifest(files)
     user_msg = (
         f"## Current memory manifest ({len(files)} files)\n\n"
@@ -533,217 +729,230 @@ async def run_long_reflection(
 
     _, changed, reason = await _reflection_loop(
         llm,
-        _LONG_REFLECT_SYSTEM,
+        _build_unified_long_reflect_system(),
         user_msg,
         mem_dir,
-        caller=caller,
+        queen_id=None,
     )
     if changed:
         logger.debug(
-            "reflect: long reflection done [%s] (%d files), changed files: %s",
-            caller,
+            "reflect: long reflection done for %s (%d files), changed: %s",
+            scope_label,
             len(files),
             changed,
         )
     else:
         logger.debug(
-            "reflect: long reflection done [%s] (%d files), no changes — %s",
-            caller,
+            "reflect: long reflection done for %s (%d files), no changes — %s",
+            scope_label,
             len(files),
-            reason or "no reason given",
+            reason or "no reason",
         )
 
 
-async def run_diary_update(
+async def run_unified_long_reflection(
+    llm: Any,
+    *,
+    global_memory_dir: Path | None = None,
+    queen_memory_dir: Path | None = None,
+    queen_id: str | None = None,
+) -> None:
+    """Run one housekeeping loop across all active memory scopes."""
+    global_dir = global_memory_dir or _default_global_memory_dir()
+    memory_dirs = {"global": global_dir}
+    if queen_memory_dir is not None and queen_id:
+        memory_dirs["queen"] = queen_memory_dir
+
+    manifest = _format_multi_scope_manifest(memory_dirs, queen_id=queen_id if "queen" in memory_dirs else None)
+    user_msg = (
+        "## Current memory manifest across scopes\n\n"
+        f"{manifest}\n\n"
+        f"Timestamp: {datetime.now().isoformat(timespec='minutes')}"
+    )
+
+    _, changed, reason = await _reflection_loop(
+        llm,
+        _build_unified_long_reflect_system(queen_id if "queen" in memory_dirs else None),
+        user_msg,
+        memory_dirs,
+        queen_id=queen_id if "queen" in memory_dirs else None,
+    )
+    if changed:
+        logger.debug("reflect: unified long reflection changed: %s", changed)
+    else:
+        logger.debug("reflect: unified long reflection no changes — %s", reason or "no reason")
+
+
+async def run_shutdown_reflection(
     session_dir: Path,
     llm: Any,
     memory_dir: Path | None = None,
+    *,
+    global_memory_dir_override: Path | None = None,
+    queen_memory_dir: Path | None = None,
+    queen_id: str | None = None,
 ) -> None:
-    """Update today's diary file with a narrative of recent activity."""
-    mem_dir = memory_dir or MEMORY_DIR
+    """Run a final short reflection on session shutdown.
 
-    fname = diary_filename()
-    diary_path = mem_dir / fname
-    today_str = datetime.now().strftime("%Y-%m-%d")
-
-    # Read existing diary body (strip frontmatter).
-    existing_body = ""
-    if diary_path.exists():
-        try:
-            raw = diary_path.read_text(encoding="utf-8")
-            m = re.match(r"^---\s*\n.*?\n---\s*\n?", raw, re.DOTALL)
-            existing_body = raw[m.end() :].strip() if m else raw.strip()
-        except OSError:
-            pass
-
-    # Read all conversation messages for context.
-    messages = await read_conversation_parts(session_dir)
-    transcript_lines: list[str] = []
-    for msg in messages[-40:]:
-        role = msg.get("role", "")
-        content = str(msg.get("content", "")).strip()
-        if role == "tool" or not content:
-            continue
-        label = "user" if role == "user" else "assistant"
-        if len(content) > 600:
-            content = content[:600] + "..."
-        transcript_lines.append(f"[{label}]: {content}")
-
-    if not transcript_lines:
-        return
-
-    transcript = "\n".join(transcript_lines)
-    user_msg = (
-        f"## Today's Diary So Far\n\n"
-        f"{existing_body or '(no entries yet)'}\n\n"
-        f"## Recent Conversation\n\n"
-        f"{transcript}\n\n"
-        f"Date: {today_str}"
-    )
-
+    Called during session teardown so recent conversation insights are
+    persisted before the session is destroyed.
+    """
+    logger.info("reflect: running shutdown reflection for %s", session_dir)
     try:
-        from framework.agents.queen.config import default_config
-
-        resp = await llm.acomplete(
-            messages=[{"role": "user", "content": user_msg}],
-            system=_DIARY_SYSTEM,
-            max_tokens=min(default_config.max_tokens, 1024),
+        global_dir = global_memory_dir_override or memory_dir or _default_global_memory_dir()
+        await run_unified_short_reflection(
+            session_dir,
+            llm,
+            global_memory_dir=global_dir,
+            queen_memory_dir=queen_memory_dir,
+            queen_id=queen_id,
         )
-        new_body = (resp.content or "").strip()
-        if not new_body:
-            return
-
-        doc = build_diary_document(date_str=today_str, body=new_body)
-        if len(doc.encode("utf-8")) > MAX_FILE_SIZE_BYTES:
-            new_body = new_body[:2800]
-            doc = build_diary_document(date_str=today_str, body=new_body)
-
-        mem_dir.mkdir(parents=True, exist_ok=True)
-        diary_path.write_text(doc, encoding="utf-8")
-        logger.debug("diary: updated %s (%d chars)", fname, len(doc))
+        logger.info("reflect: shutdown reflection completed for %s", session_dir)
+    except asyncio.CancelledError:
+        logger.warning("reflect: shutdown reflection cancelled for %s", session_dir)
     except Exception:
-        logger.warning("diary: update failed", exc_info=True)
+        logger.warning("reflect: shutdown reflection failed", exc_info=True)
+        _write_error(
+            "shutdown reflection",
+            global_memory_dir_override or memory_dir or _default_global_memory_dir(),
+        )
 
 
 # ---------------------------------------------------------------------------
 # Event-bus integration
 # ---------------------------------------------------------------------------
 
-# Run a long reflection every N short reflections.
 _LONG_REFLECT_INTERVAL = 5
+_SHORT_REFLECT_TURN_INTERVAL = 3
+_SHORT_REFLECT_COOLDOWN_SEC = 300.0
 
 
 async def subscribe_reflection_triggers(
     event_bus: Any,
     session_dir: Path,
     llm: Any,
-    memory_dir: Path | None = None,
-    phase_state: Any = None,
+    global_memory_dir: Path | None = None,
+    queen_memory_dir: Path | None = None,
+    queen_id: str | None = None,
 ) -> list[str]:
     """Subscribe to queen turn events and return subscription IDs.
 
     Call this once during queen setup.  Returns a list of event-bus
     subscription IDs for cleanup during session teardown.
     """
-    from framework.runtime.event_bus import EventType
+    from framework.host.event_bus import EventType
 
-    mem_dir = memory_dir or MEMORY_DIR
+    global_mem_dir = global_memory_dir or _default_global_memory_dir()
+    queen_mem_dir = queen_memory_dir
     _lock = asyncio.Lock()
     _short_count = 0
+    _short_has_run = False
+    _last_short_time: float = 0.0
+    _background_tasks: set[asyncio.Task] = set()
+
+    async def _run_with_error_capture(coro: Any, *, context: str, memory_dir: Path) -> None:
+        try:
+            await coro
+        except Exception:
+            logger.warning("reflect: %s failed", context, exc_info=True)
+            _write_error(context, memory_dir)
+
+    async def _do_turn_reflect(is_interval: bool, count: int) -> None:
+        async with _lock:
+            await _run_with_error_capture(
+                run_unified_short_reflection(
+                    session_dir,
+                    llm,
+                    global_memory_dir=global_mem_dir,
+                    queen_memory_dir=queen_mem_dir,
+                    queen_id=queen_id,
+                ),
+                context="unified short reflection",
+                memory_dir=global_mem_dir,
+            )
+            if is_interval:
+                await _run_with_error_capture(
+                    run_unified_long_reflection(
+                        llm,
+                        global_memory_dir=global_mem_dir,
+                        queen_memory_dir=queen_mem_dir,
+                        queen_id=queen_id,
+                    ),
+                    context="unified long reflection",
+                    memory_dir=global_mem_dir,
+                )
+
+    async def _do_compaction_reflect() -> None:
+        async with _lock:
+            await _run_with_error_capture(
+                run_unified_long_reflection(
+                    llm,
+                    global_memory_dir=global_mem_dir,
+                    queen_memory_dir=queen_mem_dir,
+                    queen_id=queen_id,
+                ),
+                context="unified compaction reflection",
+                memory_dir=global_mem_dir,
+            )
+
+    def _fire_and_forget(coro: Any) -> None:
+        """Spawn a background task and prevent GC before it finishes."""
+        task = asyncio.create_task(coro)
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
     async def _on_turn_complete(event: Any) -> None:
-        nonlocal _short_count
+        nonlocal _short_count, _short_has_run, _last_short_time
 
-        # Only process queen turns.
         if getattr(event, "stream_id", None) != "queen":
             return
 
         _short_count += 1
 
-        # Decide whether to reflect: only when the LLM turn ended without
-        # tool calls (a conversational response) OR every _LONG_REFLECT_INTERVAL turns.
         event_data = getattr(event, "data", {}) or {}
         stop_reason = event_data.get("stop_reason", "")
         is_tool_turn = stop_reason in ("tool_use", "tool_calls")
         is_interval = _short_count % _LONG_REFLECT_INTERVAL == 0
 
         if is_tool_turn and not is_interval:
-            logger.debug(
-                "reflect: skipping turn %d (stop_reason=%s, next reflect at %d)",
-                _short_count,
-                stop_reason,
-                (_short_count // _LONG_REFLECT_INTERVAL + 1) * _LONG_REFLECT_INTERVAL,
-            )
+            logger.debug("reflect: skipping tool turn (count=%d)", _short_count)
             return
+
+        # Apply turn-interval and cooldown gates after the first reflection.
+        if _short_has_run:
+            now = time.monotonic()
+            turn_ok = _short_count % _SHORT_REFLECT_TURN_INTERVAL == 0
+            cooldown_ok = (now - _last_short_time) >= _SHORT_REFLECT_COOLDOWN_SEC
+            if not turn_ok and not cooldown_ok:
+                logger.debug(
+                    "reflect: skipping, below turn/cooldown threshold (count=%d)",
+                    _short_count,
+                )
+                return
 
         if _lock.locked():
-            logger.debug("reflect: skipping — reflection already in progress")
+            logger.debug("reflect: skipping, already running (count=%d)", _short_count)
             return
 
-        async with _lock:
-            try:
-                logger.debug(
-                    "reflect: turn complete — count %d/%d (stop_reason=%s)",
-                    _short_count,
-                    _LONG_REFLECT_INTERVAL,
-                    stop_reason,
-                )
-                if is_interval:
-                    await run_short_reflection(session_dir, llm, mem_dir, caller="queen")
-                    await run_long_reflection(llm, mem_dir, caller="queen")
-                else:
-                    await run_short_reflection(session_dir, llm, mem_dir, caller="queen")
-            except Exception:
-                logger.warning("reflect: reflection failed", exc_info=True)
-                _write_error("short/long reflection")
+        _short_has_run = True
+        _last_short_time = time.monotonic()
 
-            # Update daily diary after reflection.
-            try:
-                await run_diary_update(session_dir, llm, mem_dir)
-            except Exception:
-                logger.warning("reflect: diary update failed", exc_info=True)
-
-            # Update recall cache after reflection completes, guaranteeing
-            # recall sees the current turn's extracted memories.
-            if phase_state is not None:
-                try:
-                    from framework.agents.queen.recall_selector import update_recall_cache
-
-                    await update_recall_cache(
-                        session_dir,
-                        llm,
-                        cache_setter=lambda block: (
-                            setattr(phase_state, "_cached_colony_recall_block", block),
-                            setattr(phase_state, "_cached_recall_block", block),
-                        ),
-                        memory_dir=mem_dir,
-                        heading="Colony Memories",
-                    )
-                    await update_recall_cache(
-                        session_dir,
-                        llm,
-                        cache_setter=lambda block: setattr(
-                            phase_state, "_cached_global_recall_block", block
-                        ),
-                        memory_dir=getattr(phase_state, "global_memory_dir", None),
-                        heading="Global Memories",
-                    )
-                except Exception:
-                    logger.debug("recall: cache update failed", exc_info=True)
+        logger.debug(
+            "reflect: triggered (count=%d, interval=%s, stop_reason=%s)",
+            _short_count,
+            is_interval,
+            stop_reason,
+        )
+        _fire_and_forget(_do_turn_reflect(is_interval, _short_count))
 
     async def _on_compaction(event: Any) -> None:
         if getattr(event, "stream_id", None) != "queen":
             return
-
         if _lock.locked():
+            logger.debug("reflect: skipping compaction trigger, already running")
             return
-
-        async with _lock:
-            try:
-                await run_long_reflection(llm, mem_dir, caller="queen")
-            except Exception:
-                logger.warning("reflect: compaction-triggered reflection failed", exc_info=True)
-                _write_error("compaction reflection")
+        logger.debug("reflect: compaction triggered long reflection")
+        _fire_and_forget(_do_compaction_reflect())
 
     sub_ids: list[str] = []
 
@@ -762,68 +971,10 @@ async def subscribe_reflection_triggers(
     return sub_ids
 
 
-async def subscribe_worker_memory_triggers(
-    event_bus: Any,
-    llm: Any,
-    *,
-    worker_sessions_dir: Path,
-    colony_memory_dir: Path,
-    recall_cache: dict[str, str],
-) -> list[str]:
-    """Subscribe colony memory lifecycle events for worker runs.
-
-    Short reflection is now handled synchronously at node handoff in
-    ``WorkerAgent._reflect_colony_memory()``.  This function only manages:
-    - Recall cache initialisation on execution start
-    - Final long reflection + cleanup on execution end
-    """
-    from framework.runtime.event_bus import EventType
-
-    _terminal_lock = asyncio.Lock()
-
-    def _is_worker_event(event: Any) -> bool:
-        return bool(
-            getattr(event, "execution_id", None)
-            and getattr(event, "stream_id", None) not in ("queen", "judge")
-        )
-
-    async def _on_execution_started(event: Any) -> None:
-        if not _is_worker_event(event):
-            return
-        if event.execution_id is not None:
-            recall_cache[event.execution_id] = ""
-
-    async def _on_execution_terminal(event: Any) -> None:
-        if not _is_worker_event(event):
-            return
-        execution_id = event.execution_id
-        if execution_id is None:
-            return
-        async with _terminal_lock:
-            try:
-                await run_long_reflection(llm, colony_memory_dir, caller="worker")
-            except Exception:
-                logger.warning("reflect: worker final reflection failed", exc_info=True)
-                _write_error("worker final reflection")
-            finally:
-                recall_cache.pop(execution_id, None)
-
-    return [
-        event_bus.subscribe(
-            event_types=[EventType.EXECUTION_STARTED],
-            handler=_on_execution_started,
-        ),
-        event_bus.subscribe(
-            event_types=[EventType.EXECUTION_COMPLETED, EventType.EXECUTION_FAILED],
-            handler=_on_execution_terminal,
-        ),
-    ]
-
-
-def _write_error(context: str) -> None:
+def _write_error(context: str, memory_dir: Path) -> None:
     """Best-effort write of the last traceback to an error file."""
     try:
-        error_path = MEMORY_DIR / ".reflection_error.txt"
+        error_path = memory_dir / ".reflection_error.txt"
         error_path.parent.mkdir(parents=True, exist_ok=True)
         error_path.write_text(
             f"context: {context}\ntime: {datetime.now().isoformat()}\n\n{traceback.format_exc()}",

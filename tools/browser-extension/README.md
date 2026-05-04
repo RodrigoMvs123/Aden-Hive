@@ -20,7 +20,12 @@ Your existing Chrome browser
 - Each subagent → one `chrome.tabGroups` entry, colour-coded in your tab bar
 - `context.destroy` closes the group's tabs; Chrome stays alive
 
-## Install (unpacked extension)
+## Install
+
+Install from the Chrome Web Store:
+https://chromewebstore.google.com/detail/hive-browser-bridge/jkpcegnbfimimjodblcemoheedidnppm
+
+### Developer install (unpacked)
 
 1. Open `chrome://extensions`
 2. Enable **Developer mode**
@@ -56,7 +61,7 @@ All replies carry `{ id, result }` or `{ id, error }`.
 # 1. At GCU server startup, open ws://localhost:9229/beeline and wait for
 #    the extension to connect (sends { type: "hello" }).
 #
-# 2. On browser_start(profile):
+# 2. On the first browser tool call for a profile (lazy-start via _ensure_context):
 #    - Send { id, type: "context.create", agentId: profile }
 #    - Receive { groupId, tabId }
 #    - Store groupId in the session object (no Chrome process, no CDP port)
