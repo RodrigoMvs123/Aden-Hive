@@ -947,8 +947,7 @@ conversation ends. Typical triggers:
      task is baked into worker.json and the user starts the \
      worker (or wires up a trigger) later from the new colony \
      page. The task string must still be FULL and self-contained \
-     because triggers fire without your chat context.
-=======
+
 See "Independent execution" for the per-step flow and granularity rule.
 
 ## File I/O (files-tools MCP)
