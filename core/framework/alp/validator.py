@@ -1,4 +1,4 @@
-"""ALP card validator — validates a card dict against the ALP JSON schema."""
+"""ALP card validator — validates a card dict against the ALP JSON schema (v0.9.0)."""
 
 import logging
 import urllib.request

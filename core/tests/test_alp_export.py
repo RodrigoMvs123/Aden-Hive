@@ -17,7 +17,7 @@ EXAMPLE_CARD_URL = (
 )
 
 MINIMAL_VALID_CARD = {
-    "alp_version": "0.2.2",
+    "alp_version": "0.9.0",
     "id": "test-agent",
     "name": "Test Agent",
     "persona": "You are a test agent.",
@@ -70,7 +70,7 @@ class TestExportAlpCard:
         agent_dir = _make_mock_agent(tmp_path)
 
         with patch("framework.alp.exporter._resolve_agent_path", return_value=agent_dir):
-            with patch("framework.config.get_hive_config",
+            with patch("framework.alp.exporter.get_hive_config",
                        return_value={"llm": {"model": "gemini/gemini-2.0-flash"}}):
                 card = export_alp_card("test_agent")
 
@@ -83,10 +83,10 @@ class TestExportAlpCard:
 
         agent_dir = _make_mock_agent(tmp_path)
         with patch("framework.alp.exporter._resolve_agent_path", return_value=agent_dir):
-            with patch("framework.config.get_hive_config", return_value={}):
+            with patch("framework.alp.exporter.get_hive_config", return_value={}):
                 card = export_alp_card("test_agent")
 
-        assert card["alp_version"] == "0.2.2"
+        assert card["alp_version"] == "0.9.0"
 
     def test_no_secrets_in_card(self, tmp_path):
         """Card must not contain any raw API keys — only auth_ref strings."""
@@ -94,7 +94,7 @@ class TestExportAlpCard:
 
         agent_dir = _make_mock_agent(tmp_path)
         with patch("framework.alp.exporter._resolve_agent_path", return_value=agent_dir):
-            with patch("framework.config.get_hive_config",
+            with patch("framework.alp.exporter.get_hive_config",
                        return_value={"llm": {"model": "anthropic/claude-3-haiku",
                                              "api_key_env_var": "ANTHROPIC_API_KEY"}}):
                 card = export_alp_card("test_agent")
@@ -109,7 +109,7 @@ class TestExportAlpCard:
 
         agent_dir = _make_mock_agent(tmp_path)
         with patch("framework.alp.exporter._resolve_agent_path", return_value=agent_dir):
-            with patch("framework.config.get_hive_config", return_value={}):
+            with patch("framework.alp.exporter.get_hive_config", return_value={}):
                 card = export_alp_card("test_agent")
 
         tool_names = [t["name"] for t in card.get("tools", [])]
@@ -121,12 +121,38 @@ class TestExportAlpCard:
 
         agent_dir = _make_mock_agent(tmp_path)
         with patch("framework.alp.exporter._resolve_agent_path", return_value=agent_dir):
-            with patch("framework.config.get_hive_config",
+            with patch("framework.alp.exporter.get_hive_config",
                        return_value={"llm": {"model": "gemini/gemini-2.0-flash"}}):
                 card = export_alp_card("test_agent")
 
         assert card["llm"]["provider"] == "google"
         assert card["llm"]["model"] == "gemini-2.0-flash"
+
+    def test_v090_fields_present(self, tmp_path):
+        """Card includes new v0.9.0 fields: runtime, toolsets, security, server.channel."""
+        from framework.alp.exporter import export_alp_card
+
+        agent_dir = _make_mock_agent(tmp_path)
+        with patch("framework.alp.exporter._resolve_agent_path", return_value=agent_dir):
+            with patch("framework.alp.exporter.get_hive_config", return_value={}):
+                card = export_alp_card("test_agent")
+
+        # runtime.deploy block (v0.9.0)
+        assert "runtime" in card
+        assert "deploy" in card["runtime"]
+        assert card["runtime"]["deploy"]["trigger"] == "manual"
+
+        # toolsets (v0.3.0)
+        assert "toolsets" in card
+        assert "groups" in card["toolsets"]
+
+        # security (v0.3.0)
+        assert "security" in card
+        assert "read_only" in card["security"]
+        assert "max_tool_retries" in card["security"]
+
+        # server.channel (v0.9.0)
+        assert card["server"]["channel"] == "stable"
 
 
 # ---------------------------------------------------------------------------

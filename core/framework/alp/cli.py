@@ -10,10 +10,10 @@ def register_alp_commands(subparsers: argparse._SubParsersAction) -> None:
     """Register ALP export command with the main CLI."""
     p = subparsers.add_parser(
         "export-alp",
-        help="Export a Hive agent as an ALP v0.2.2 card (agent.alp.json)",
+        help="Export a Hive agent as an ALP v0.9.0 card (agent.alp.json)",
         description=(
             "Reads a finalized Hive worker agent graph and writes an ALP-compliant "
-            "agent.alp.json card to the current directory."
+            "agent.alp.json card (v0.9.0) to the current directory."
         ),
     )
     p.add_argument(

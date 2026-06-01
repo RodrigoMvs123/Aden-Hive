@@ -1,7 +1,9 @@
 """ALP (Agent Load Protocol) exporter for Hive agents.
 
-Reads a finalized Hive worker agent graph and maps it to an ALP v0.2.2 card.
+Reads a finalized Hive worker agent graph and maps it to an ALP v0.9.0 card.
 """
+
+from __future__ import annotations
 
 import json
 import logging
@@ -13,7 +15,7 @@ from framework.config import get_hive_config
 
 logger = logging.getLogger(__name__)
 
-ALP_VERSION = "0.2.2"
+ALP_VERSION = "0.9.0"
 ALP_SCHEMA_URL = (
     "https://raw.githubusercontent.com/RodrigoMvs123/agent-load-protocol"
     "/main/schema/agent.alp.schema.json"
@@ -71,7 +73,7 @@ def _map_capabilities(agent_data: dict) -> list[str]:
     return list(dict.fromkeys(caps))  # deduplicate, preserve order
 
 
-def _map_tools(agent_data: dict, server_url: str) -> list[dict]:
+def _map_tools(agent_data: dict) -> list[dict]:
     """Map Hive agent nodes with tools to ALP tool definitions."""
     graph = agent_data.get("graph", {})
     nodes = graph.get("nodes", [])
@@ -90,6 +92,7 @@ def _map_tools(agent_data: dict, server_url: str) -> list[dict]:
                 "name": tool_name,
                 "description": f"Hive tool: {tool_name.replace('_', ' ')}",
                 "endpoint": f"/tools/{tool_name}",
+                "readonly": False,
             })
 
     # Also include required_tools not already covered
@@ -100,6 +103,7 @@ def _map_tools(agent_data: dict, server_url: str) -> list[dict]:
                 "name": tool_name,
                 "description": f"Hive tool: {tool_name.replace('_', ' ')}",
                 "endpoint": f"/tools/{tool_name}",
+                "readonly": False,
             })
 
     return alp_tools
@@ -122,12 +126,13 @@ def _resolve_agent_path(agent_id: str) -> Path:
     3. ~/.hive/agents/<agent_id>
     """
     from framework.cli import _configure_paths
+
     _configure_paths()
 
     # Determine project root
     framework_dir = Path(__file__).resolve().parent.parent  # core/framework
-    core_dir = framework_dir.parent                          # core
-    project_root = core_dir.parent                           # project root
+    core_dir = framework_dir.parent  # core
+    project_root = core_dir.parent  # project root
 
     candidates = [
         project_root / "exports" / agent_id,
@@ -149,14 +154,18 @@ def export_alp_card(
     agent_id: str,
     server_url: str = "https://your-hive-alp-server.com",
 ) -> dict[str, Any]:
-    """Read a finalized Hive worker agent and return an ALP v0.2.2 card dict.
+    """Read a finalized Hive worker agent and return an ALP v0.9.0 card dict.
+
+    Maps the Hive agent graph to the ALP v0.9.0 schema including the new
+    runtime.deploy block, toolsets, security, and server_card fields.
+    No secrets are included — credentials become auth_ref string IDs only.
 
     Args:
         agent_id: The agent directory name (e.g. 'meeting_notes_agent').
         server_url: The URL where this agent's ALP server is hosted.
 
     Returns:
-        A dict conforming to the ALP v0.2.2 schema. No secrets included.
+        A dict conforming to the ALP v0.9.0 schema. No secrets included.
     """
     agent_path = _resolve_agent_path(agent_id)
     agent_data = _load_agent_data(agent_path)
@@ -179,14 +188,16 @@ def export_alp_card(
     capabilities = _map_capabilities(agent_data)
 
     # Tools
-    tools = _map_tools(agent_data, server_url)
+    tools = _map_tools(agent_data)
 
-    # Workforce: Hive workers are standalone by default
-    # Queen-managed agents are "worker" role
-    workforce = {
-        "role": "worker",
-        "connections": [],
-    }
+    # Toolsets — group all tools under a default set (v0.3.0)
+    tool_names = [t["name"] for t in tools]
+    toolsets: dict[str, Any] = {}
+    if tool_names:
+        toolsets = {
+            "groups": {"default": tool_names},
+            "active": "default",
+        }
 
     card: dict[str, Any] = {
         "alp_version": ALP_VERSION,
@@ -201,6 +212,19 @@ def export_alp_card(
             "model": alp_model,
         },
         "tools": tools,
+        # Toolsets — named groups of tools (v0.3.0)
+        "toolsets": toolsets,
+        # Dynamic tool discovery disabled by default (v0.3.0)
+        "tools_discovery": {
+            "enabled": False,
+            "mode": "static",
+        },
+        # Security defaults (v0.3.0)
+        "security": {
+            "read_only": False,
+            "lockdown_mode": False,
+            "max_tool_retries": 3,
+        },
         "memory": {
             "enabled": True,
             "backend": "hive-internal",
@@ -210,7 +234,11 @@ def export_alp_card(
             "endpoint": "/stream",
             "logs_endpoint": "/logs",
         },
-        "workforce": workforce,
+        # Workforce: Hive workers are standalone by default
+        "workforce": {
+            "role": "worker",
+            "connections": [],
+        },
         "alerts": [
             {
                 "trigger": "tool_failure",
@@ -225,9 +253,19 @@ def export_alp_card(
                 "auth_ref": "hive_alert_email",
             },
         ],
+        # GitHub-native deploy config (v0.9.0)
+        # Credentials are declared by ref only — values never stored here
+        "runtime": {
+            "deploy": {
+                "trigger": "manual",
+                "workflow": ".github/workflows/deploy.yml",
+                "credentials": [],
+            }
+        },
         "server": {
             "url": server_url,
             "transport": "websocket",
+            "channel": "stable",
         },
         "marketplace": {
             "category": "automation",
